@@ -1,5 +1,5 @@
-(* luabinge — C header -> LuaJIT FFI + OCaml externals + C stubs
-   Usage: ocaml -I +str str.cma luabinge.ml [--prefix PREFIX] <header.h> *)
+(* luabingen — C header -> LuaJIT FFI + OCaml externals + C stubs
+   Usage: ocaml -I +str str.cma luabingen.ml [--prefix PREFIX] <header.h> *)
 
 let prefix = ref ""
 let remaining_args = ref []
@@ -13,11 +13,11 @@ let () =
     [ "--prefix", Arg.Set_string prefix,
       " Function name prefix to strip (e.g. RLAPI_)" ]
     (fun s -> remaining_args := s :: !remaining_args)
-    "luabinge [--prefix PREFIX] <header.h>";
+    "luabingen [--prefix PREFIX] <header.h>";
 
   let args = List.rev !remaining_args in
   if List.length args < 1 then
-    (Printf.eprintf "Usage: luabinge [--prefix PREFIX] <header.h>\n"; exit 1);
+    (Printf.eprintf "Usage: luabingen [--prefix PREFIX] <header.h>\n"; exit 1);
 
   let header = List.hd args in
   let base = Filename.chop_extension (Filename.basename header) in

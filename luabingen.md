@@ -1,4 +1,6 @@
-# luabinge — C Header to LuaJIT FFI + OCaml Bindings
+# luabingen — C Header to LuaJIT FFI + OCaml Bindings
+
+[GitHub](https://github.com/maltasea/luabindgen)
 
 Takes a C header file and generates three files:
 
@@ -10,10 +12,10 @@ Takes a C header file and generates three files:
 
 Requires OCaml 4.13+ with the `str` library.
 
-    ocaml -I +str str.cma luabinge.ml [--prefix PREFIX] <header.h>
+    ocaml -I +str str.cma luabingen.ml [--prefix PREFIX] <header.h>
 
     # Example: strip "RLAPI " prefix from raylib functions
-    ocaml -I +str str.cma luabinge.ml --prefix "RLAPI " raylib.h
+    ocaml -I +str str.cma luabingen.ml --prefix "RLAPI " raylib.h
 
 ## Output
 
@@ -64,7 +66,7 @@ OCaml value conversion helpers are included:
 ## Putting It Together
 
     # Generate bindings from header
-    ocaml -I +str str.cma luabinge.ml --prefix "RLAPI " raylib.h
+    ocaml -I +str str.cma luabingen.ml --prefix "RLAPI " raylib.h
     # -> raylib_external.ml, raylib_stubs.c, raylib_bindings.lua
 
     # Write your OCaml game using the generated externals
