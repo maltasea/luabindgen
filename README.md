@@ -1,1 +1,1 @@
-# luabindgen
+# luabinge — lua binding generator
