@@ -1,4 +1,4 @@
-# platformer
+# raylib-platformer
 
 End-to-end demo: OCaml game → bytecode → lua_of_ocaml → luajit → libraylib.
 
