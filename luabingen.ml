@@ -1516,6 +1516,163 @@ module Lua_parse = struct
 end
 
 (* ================================================================== *)
+(* Lua-input emitter                                                   *)
+(* ================================================================== *)
+(* Type info cannot be recovered from Lua source — we know names and
+   arity, not whether `l` in `random(l, u)` is an int or float. So we
+   emit conservative defaults: all args float, all returns float,
+   method-receivers as an abstract class type. The output is a
+   binding *skeleton* the user edits.
+
+   ffi.cdef blobs found inside the Lua source are concatenated into a
+   single block in the generated _bindings.lua, so LuaJIT still sees
+   the C type definitions the source declared. *)
+
+module Lua_emit = struct
+  open Lua_ast
+
+  (* Flat external name for an OCaml-visible function.
+       love_math.random       -> love_math_random
+       love.event.poll        -> love_event_poll
+       RandomGenerator:random -> random_generator_random           *)
+  let ext_name fp =
+    let p = String.concat "_" (List.map Typ.snake fp.path) in
+    match fp.method_ with
+    | Some m -> p ^ "_" ^ Typ.snake m
+    | None -> p
+
+  (* When fp is a method, the receiver class identifier (used both as
+     the OCaml type name and to dispatch on the Lua side). *)
+  let receiver_class fp =
+    match fp.method_, List.rev fp.path with
+    | Some _, last :: _ -> Some last
+    | _ -> None
+
+  let classes fns =
+    (* Distinct class names in encounter order *)
+    let seen = Hashtbl.create 8 in
+    List.filter_map (fun f ->
+      match receiver_class f.fp with
+      | Some c when not (Hashtbl.mem seen c) ->
+          Hashtbl.add seen c (); Some c
+      | _ -> None
+    ) fns
+
+  (* LÖVE wrap files routinely define the same function twice (e.g.
+     one branch for JIT, one for non-JIT). Lua semantics: the latter
+     wins. OCaml can't have duplicate externals at all, so we drop
+     earlier duplicates and keep the last occurrence. *)
+  let dedup_fns fns =
+    let total = Hashtbl.create 32 in
+    List.iter (fun f ->
+      let k = ext_name f.fp in
+      Hashtbl.replace total k
+        (1 + (try Hashtbl.find total k with Not_found -> 0))
+    ) fns;
+    let seen = Hashtbl.create 32 in
+    List.filter (fun f ->
+      let k = ext_name f.fp in
+      let i = (try Hashtbl.find seen k with Not_found -> 0) + 1 in
+      Hashtbl.replace seen k i;
+      i = Hashtbl.find total k
+    ) fns
+
+  let write_ml ~src ~fns out =
+    let fns = dedup_fns fns in
+    Printf.fprintf out "(* Auto-generated from %s *)\n" src;
+    Printf.fprintf out "(* All signatures are conservative defaults — \
+                        edit as needed. *)\n\n";
+    let cs = classes fns in
+    List.iter (fun c -> Printf.fprintf out "type %s\n" (Typ.snake c)) cs;
+    if cs <> [] then Printf.fprintf out "\n";
+    List.iter (fun f ->
+      let name = ext_name f.fp in
+      let self_arg = match receiver_class f.fp with
+        | Some c -> [Typ.snake c]
+        | None -> [] in
+      let arg_count = List.length f.params in
+      let other_args = List.init arg_count (fun _ -> "float") in
+      let args = self_arg @ other_args in
+      let args = if args = [] then ["unit"] else args in
+      let sig_ = String.concat " -> " (args @ ["float"]) in
+      Printf.fprintf out "external %s : %s = \"%s\"\n" name sig_ name
+    ) fns
+
+  let write_c ~src ~fns out =
+    let fns = dedup_fns fns in
+    Printf.fprintf out "/* Auto-generated from %s */\n" src;
+    Printf.fprintf out "#include <caml/mlvalues.h>\n\n";
+    List.iter (fun f ->
+      let name = ext_name f.fp in
+      let has_self = receiver_class f.fp <> None in
+      let arg_count =
+        (if has_self then 1 else 0) + List.length f.params in
+      Printf.fprintf out "CAMLprim value %s(" name;
+      if arg_count = 0 then Printf.fprintf out "value v_unit"
+      else for i = 1 to arg_count do
+        if i > 1 then Printf.fprintf out ",";
+        Printf.fprintf out "value v%d" i
+      done;
+      Printf.fprintf out ") { ";
+      if arg_count = 0 then Printf.fprintf out "(void)v_unit; "
+      else for i = 1 to arg_count do
+        Printf.fprintf out "(void)v%d; " i
+      done;
+      (* default return: boxed float so it parses as a float OCaml
+         value; the user re-tags if they change the return type *)
+      Printf.fprintf out "return Val_int(0); }\n"
+    ) fns
+
+  let write_lua ~src ~fns ~cdefs out =
+    let fns = dedup_fns fns in
+    Printf.fprintf out "-- Auto-generated from %s\n" src;
+    Printf.fprintf out "-- Conservative wrappers: all args unwrapped \
+                        as numbers, all returns boxed as floats.\n";
+    Printf.fprintf out "-- Edit the per-fn conversion as the OCaml \
+                        signatures sharpen.\n\n";
+    if cdefs <> [] then begin
+      Printf.fprintf out "local ffi = require(\"ffi\")\n\n";
+      Printf.fprintf out "ffi.cdef([[\n";
+      List.iter (fun c -> Printf.fprintf out "%s\n" c) cdefs;
+      Printf.fprintf out "]])\n\n"
+    end;
+    Printf.fprintf out
+      "local function ocaml_val(v)\n\
+      \  if type(v) == \"number\" then return v / 2 end\n\
+      \  if type(v) == \"table\" and v[1] == 253 then return v[2] or 0 end\n\
+      \  return v\n\
+       end\n\n";
+    List.iter (fun f ->
+      let name = ext_name f.fp in
+      let has_self = receiver_class f.fp <> None in
+      let arg_count =
+        (if has_self then 1 else 0) + List.length f.params in
+      let params =
+        String.concat ","
+          (List.init arg_count (fun i -> Printf.sprintf "a%d" (i + 1))) in
+      let call =
+        if has_self then begin
+          let method_ = match f.fp.method_ with Some m -> m | None -> "" in
+          let other_args =
+            String.concat ", "
+              (List.mapi (fun i _ ->
+                 Printf.sprintf "ocaml_val(a%d)" (i + 2)) f.params) in
+          Printf.sprintf "a1[2]:%s(%s)" method_ other_args
+        end else begin
+          let lua_target = String.concat "." f.fp.path in
+          let args_str =
+            String.concat ", "
+              (List.mapi (fun i _ ->
+                 Printf.sprintf "ocaml_val(a%d)" (i + 1)) f.params) in
+          Printf.sprintf "%s(%s)" lua_target args_str
+        end
+      in
+      Printf.fprintf out "function %s(%s) return { 253, %s } end\n"
+        name params call
+    ) fns
+end
+
+(* ================================================================== *)
 (* CLI                                                                 *)
 (* ================================================================== *)
 
@@ -1579,11 +1736,8 @@ let process_c_header header =
   close_out oc;
   Printf.printf "Wrote %s\n" lua_path
 
-(* For Lua sources we don't yet emit OCaml/C/Lua bindings — the
-   lua_of_ocaml conventions to target are not vendored in ./extern/
-   yet. Instead, dump the parsed surface so we can see what we have
-   to work with. *)
 let process_lua_source path =
+  let base = Filename.chop_extension (Filename.basename path) in
   let ic = open_in path in
   let n = in_channel_length ic in
   let raw = really_input_string ic n in
@@ -1594,27 +1748,25 @@ let process_lua_source path =
   let cdefs = Lua_parse.cdef_blocks tops in
   Printf.eprintf "[Lua] %d public fn decls, %d ffi.cdef blocks from %s\n"
     (List.length fns) (List.length cdefs) (Filename.basename path);
-  List.iter (fun f ->
-    let open Lua_ast in
-    let mod_ = String.concat "." f.fp.path in
-    let name = match f.fp.method_ with
-      | Some m -> mod_ ^ ":" ^ m
-      | None -> mod_ in
-    let pp =
-      String.concat ", " f.params
-      ^ (if f.has_vararg then
-           (if f.params = [] then "..." else ", ...") else "")
-    in
-    Printf.printf "  %s(%s)\n" name pp
-  ) fns;
-  if cdefs <> [] then begin
-    Printf.printf "  -- ffi.cdef blocks (count=%d) --\n" (List.length cdefs);
-    List.iter (fun s ->
-      let lines = String.split_on_char '\n' s in
-      let n = List.length lines in
-      Printf.printf "    [cdef, %d lines]\n" n
-    ) cdefs
-  end
+
+  let ml_path  = join !out_dir (base ^ "_external.ml") in
+  let c_path   = join !out_dir (base ^ "_stubs.c") in
+  let lua_path = join !out_dir (base ^ "_bindings.lua") in
+
+  let oc = open_out ml_path in
+  Lua_emit.write_ml ~src:(Filename.basename path) ~fns oc;
+  close_out oc;
+  Printf.printf "Wrote %s\n" ml_path;
+
+  let oc = open_out c_path in
+  Lua_emit.write_c ~src:(Filename.basename path) ~fns oc;
+  close_out oc;
+  Printf.printf "Wrote %s\n" c_path;
+
+  let oc = open_out lua_path in
+  Lua_emit.write_lua ~src:(Filename.basename path) ~fns ~cdefs oc;
+  close_out oc;
+  Printf.printf "Wrote %s\n" lua_path
 
 let () =
   Arg.parse
