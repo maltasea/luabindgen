@@ -876,13 +876,58 @@ module Emit = struct
       else None
     ) structs
 
-  let write_ml ~env ~smap ~prefix ~src ~fns ~structs out =
+  (* Parse a raw enum-value expression. We only handle plain decimal and
+     hex literals (good enough for raylib.h's enums). Anything more
+     complex falls back to "previous + 1" auto-increment. *)
+  let parse_int_lit s =
+    try Some (int_of_string (String.trim s))
+    with _ -> None
+
+  let enum_values e =
+    let prev = ref (-1) in
+    List.map (fun (name, raw) ->
+      let v = match raw with
+        | Some s ->
+            (match parse_int_lit s with
+             | Some n -> n
+             | None -> !prev + 1)
+        | None -> !prev + 1
+      in
+      prev := v;
+      (name, v)
+    ) e.consts
+
+  let write_ml ~env ~smap ~prefix ~src ~fns ~structs ~enums out =
     Printf.fprintf out "(* Auto-generated from %s *)\n\n" src;
     (* Abstract type per struct, so signatures can reference them. *)
     List.iter (fun s ->
       Printf.fprintf out "type %s\n" (snake s.sname)
     ) structs;
     if structs <> [] then Printf.fprintf out "\n";
+    (* Enum constants — one `let name = value` per constant, snake-
+       cased. Computed expressions fall back to previous + 1. Names
+       that would clash with OCaml's reserved words / built-in
+       literals are skipped (the C-side `bool` fallback enum has
+       `true` and `false` constants — those just shadow OCaml's). *)
+    let ocaml_reserved =
+      ["true"; "false"; "and"; "or"; "not"; "mod"; "land"; "lor";
+       "lxor"; "lsl"; "lsr"; "asr"; "type"; "function"; "match";
+       "with"; "let"; "in"; "val"; "do"; "done"; "then"; "else";
+       "if"; "while"; "for"; "begin"; "end"; "rec"; "as"; "of";
+       "open"; "module"; "struct"; "sig"; "fun"; "when"; "ref";
+       "assert"; "lazy"; "include"; "object"; "class"; "method";
+       "private"; "virtual"; "constraint"; "inherit"; "initializer";
+       "new"; "object"; "to"; "downto"; "exception"; "external";
+       "try"; "raise"]
+    in
+    List.iter (fun e ->
+      List.iter (fun (name, v) ->
+        let oname = snake name in
+        if not (List.mem oname ocaml_reserved) then
+          Printf.fprintf out "let %s = %d\n" oname v
+      ) (enum_values e)
+    ) enums;
+    if enums <> [] then Printf.fprintf out "\n";
     (* Constructors for simple structs. *)
     List.iter (fun (cname, s) ->
       let arg_types =
@@ -1754,7 +1799,7 @@ let process_c_header header =
 
   let oc = open_out ml_path in
   Emit.write_ml ~env ~smap ~prefix ~src:(Filename.basename header)
-    ~fns ~structs oc;
+    ~fns ~structs ~enums oc;
   close_out oc;
   Printf.printf "Wrote %s\n" ml_path;
 
