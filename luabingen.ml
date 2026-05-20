@@ -692,7 +692,28 @@ module Typ = struct
     | Array t' -> Array (resolve env t')
     | _ -> t
 
-  (* Map a (resolved) ctype to its OCaml external type. *)
+  (* CamelCase / PascalCase -> snake_case. Kept here (rather than in
+     Emit) because ocaml_of needs it for the OCaml type name of a
+     struct. Digit↔letter boundaries don't get an underscore — that
+     keeps "Texture2D" as "texture2d", not "texture2_d". *)
+  let snake s =
+    let b = Buffer.create (String.length s + 4) in
+    String.iteri (fun i c ->
+      if c >= 'A' && c <= 'Z' then begin
+        let prev_lower =
+          i > 0 && s.[i - 1] >= 'a' && s.[i - 1] <= 'z'
+        in
+        if prev_lower then Buffer.add_char b '_';
+        Buffer.add_char b (Char.lowercase_ascii c)
+      end else
+        Buffer.add_char b c
+    ) s;
+    let r = Buffer.contents b in
+    if String.length r > 0 && r.[0] = '_'
+    then String.sub r 1 (String.length r - 1) else r
+
+  (* Map a (resolved) ctype to its OCaml external type. A struct becomes
+     an abstract OCaml type named after the struct (snake-cased). *)
   let rec ocaml_of env t =
     match resolve env t with
     | Void -> "unit"
@@ -707,10 +728,11 @@ module Typ = struct
     | Named n ->
         (match Hashtbl.find_opt env n with
          | Some KEnum -> "int"
-         | Some KStruct -> "int"      (* TODO: real struct ABI *)
+         | Some KStruct -> snake n
          | Some KCallback -> "int"
          | Some (KAlias t') -> ocaml_of env t'
          | None -> "int")
+
 end
 
 (* ================================================================== *)
@@ -720,20 +742,47 @@ end
 module Emit = struct
   open Ast
 
-  (* CamelCase / PascalCase -> snake_case *)
-  let snake s =
-    let b = Buffer.create (String.length s + 4) in
-    String.iteri (fun i c ->
-      if c >= 'A' && c <= 'Z' then begin
-        if i > 0 && (s.[i - 1] < 'A' || s.[i - 1] > 'Z') then
-          Buffer.add_char b '_';
-        Buffer.add_char b (Char.lowercase_ascii c)
-      end else
-        Buffer.add_char b c
-    ) s;
-    let r = Buffer.contents b in
-    if String.length r > 0 && r.[0] = '_'
-    then String.sub r 1 (String.length r - 1) else r
+  let snake = Typ.snake
+
+  (* Lookup a struct definition by name. *)
+  let struct_map (tops : top list) : (string, sdef) Hashtbl.t =
+    let h = Hashtbl.create 32 in
+    List.iter (function
+      | Struct s -> Hashtbl.replace h s.sname s
+      | _ -> ()) tops;
+    h
+
+  (* A struct is "simple" if every field is recursively a scalar (or a
+     simple struct). Only simple structs get auto-generated
+     constructors; everything else stays opaque-by-API. *)
+  let rec is_simple_type env smap seen t =
+    match Typ.resolve env t with
+    | Void -> false
+    | Bool | Char _ | Short _ | Int _ | Long _ | LongLong _
+    | Float | Double -> true
+    | Const t' -> is_simple_type env smap seen t'
+    | Ptr _ | Array _ -> false
+    | Named n ->
+        if List.mem n seen then true
+        else
+          (match Hashtbl.find_opt env n with
+           | Some Typ.KEnum -> true
+           | Some Typ.KStruct ->
+               (match Hashtbl.find_opt smap n with
+                | Some s ->
+                    List.for_all
+                      (fun f -> is_simple_type env smap (n :: seen) f.ftype)
+                      s.fields
+                | None -> false)
+           | Some (Typ.KAlias t') -> is_simple_type env smap seen t'
+           | Some Typ.KCallback -> false
+           | None -> false)
+
+  let is_simple_struct env smap s =
+    s.fields <> [] &&
+    List.for_all
+      (fun f -> is_simple_type env smap [s.sname] f.ftype)
+      s.fields
 
   let strip_prefix prefix name =
     let pn = String.length prefix and nn = String.length name in
@@ -764,12 +813,17 @@ module Emit = struct
     | Ptr t -> c_of t ^ " *"
     | Array t -> c_of t ^ " *"
 
-  (* Classify a *C* type for boundary conversion. The OCaml mapping
-     collapses everything non-primitive to `int`, which would be wrong
-     to multiply/divide by 2 on the Lua side — those handles are real
-     cdata, not encoded integers. So we drive conversion off the
-     underlying C type. *)
-  type abi = AVoid | AInt | ABool | AFloat | APassthrough
+  (* Classify a *C* type for boundary conversion. Drives Lua-side
+     unwrapping of args and re-tagging of returns. We distinguish
+     AStruct from APassthrough because structs cross as a wrapped block
+     {0, cdata}, not as raw cdata. *)
+  type abi =
+    | AVoid
+    | AInt
+    | ABool
+    | AFloat
+    | AStruct         (* struct-by-value: block {0, cdata} *)
+    | APassthrough    (* string, pointer, callback handle, ... *)
 
   let abi_of env t =
     let rec go t = match Typ.resolve env t with
@@ -779,27 +833,59 @@ module Emit = struct
       | Ast.Long _ | Ast.LongLong _ -> AInt
       | Ast.Float | Ast.Double -> AFloat
       | Ast.Const t' -> go t'
-      | Ast.Ptr _ | Ast.Array _ | Ast.Named _ -> APassthrough
+      | Ast.Ptr _ | Ast.Array _ -> APassthrough
+      | Ast.Named n ->
+          (match Hashtbl.find_opt env n with
+           | Some Typ.KStruct -> AStruct
+           | _ -> APassthrough)
     in go t
 
-  let needs_unwrap env t =
+  (* The Lua-side expression that converts wrapper-arg `name` (an OCaml
+     value) into the value the C function actually expects. *)
+  let arg_unwrap env t name =
     match abi_of env t with
-    | AInt | AFloat | ABool -> true
-    | AVoid | APassthrough -> false
+    | AInt | AFloat | ABool -> "ocaml_val(" ^ name ^ ")"
+    | AStruct -> name ^ "[2]"     (* block {0, cdata} -> cdata *)
+    | AVoid | APassthrough -> name
 
   (* How to re-tag a C return value back into the OCaml encoding the
-     caller expects. Mirrors the example in
-     extern/lua_of_ocaml/example-game/love_runtime.lua. *)
+     caller expects. *)
   let wrap_return env t expr_str =
     match abi_of env t with
-    | AVoid -> expr_str ^ "; return"
-    | AInt  -> "return (" ^ expr_str ^ ") * 2"
-    | ABool -> "return (" ^ expr_str ^ ") and 2 or 0"
-    | AFloat -> "return { 253, " ^ expr_str ^ " }"
+    | AVoid   -> expr_str ^ "; return"
+    | AInt    -> "return (" ^ expr_str ^ ") * 2"
+    | ABool   -> "return (" ^ expr_str ^ ") and 2 or 0"
+    | AFloat  -> "return { 253, " ^ expr_str ^ " }"
+    | AStruct -> "return { 0, " ^ expr_str ^ " }"
     | APassthrough -> "return " ^ expr_str
 
-  let write_ml ~env ~prefix ~src ~fns out =
+  (* Sequence of (constructor_name, struct_def) for the simple structs
+     in `structs`. Order is preserved so OCaml emit is stable. *)
+  let constructors env smap structs =
+    List.filter_map (fun s ->
+      if is_simple_struct env smap s
+      then Some ("make_" ^ snake s.sname, s)
+      else None
+    ) structs
+
+  let write_ml ~env ~smap ~prefix ~src ~fns ~structs out =
     Printf.fprintf out "(* Auto-generated from %s *)\n\n" src;
+    (* Abstract type per struct, so signatures can reference them. *)
+    List.iter (fun s ->
+      Printf.fprintf out "type %s\n" (snake s.sname)
+    ) structs;
+    if structs <> [] then Printf.fprintf out "\n";
+    (* Constructors for simple structs. *)
+    List.iter (fun (cname, s) ->
+      let arg_types =
+        List.map (fun f -> Typ.ocaml_of env f.ftype) s.fields in
+      let sig_ =
+        String.concat " -> " (arg_types @ [snake s.sname]) in
+      Printf.fprintf out "external %s : %s = \"%s\"\n" cname sig_ cname
+    ) (constructors env smap structs);
+    if constructors env smap structs <> []
+    then Printf.fprintf out "\n";
+    (* Function externals. *)
     List.iter (fun fn ->
       let lname = snake (strip_prefix prefix fn.name) in
       let arg_types =
@@ -812,9 +898,24 @@ module Emit = struct
       Printf.fprintf out "external %s : %s = \"%s\"\n" lname sig_ lname
     ) fns
 
-  let write_c ~prefix ~src ~fns out =
+  let write_c ~env ~smap ~prefix ~src ~fns ~structs out =
     Printf.fprintf out "/* Auto-generated from %s */\n" src;
     Printf.fprintf out "#include <caml/mlvalues.h>\n\n";
+    (* Constructor stubs first. They're never executed; loo replaces
+       them with direct Lua calls. *)
+    List.iter (fun (cname, s) ->
+      Printf.fprintf out "CAMLprim value %s(" cname;
+      let n = List.length s.fields in
+      if n = 0 then Printf.fprintf out "value v_unit"
+      else List.iteri (fun i _ ->
+        if i > 0 then Printf.fprintf out ",";
+        Printf.fprintf out "value v%d" (i + 1)) s.fields;
+      Printf.fprintf out ") { ";
+      if n = 0 then Printf.fprintf out "(void)v_unit; "
+      else List.iteri (fun i _ ->
+        Printf.fprintf out "(void)v%d; " (i + 1)) s.fields;
+      Printf.fprintf out "return Val_int(0); }\n"
+    ) (constructors env smap structs);
     List.iter (fun fn ->
       let lname = snake (strip_prefix prefix fn.name) in
       Printf.fprintf out "CAMLprim value %s(" lname;
@@ -834,10 +935,28 @@ module Emit = struct
       Printf.fprintf out " }\n"
     ) fns
 
-  let write_lua ~env ~prefix ~src ~fns out =
+  (* For struct-by-value fields we want the underlying C type for the
+     ffi.cdef, but in struct *expressions* (like ffi.new("RenderTexture",
+     {id, tex_cdata, depth_cdata})) we just hand over the cdata
+     unchanged. The Lua emitter already strips the wrapper before
+     passing values to C, so no special handling is needed here. *)
+
+  let write_lua ~env ~smap ~prefix ~src ~fns ~structs out =
     Printf.fprintf out "-- Auto-generated from %s\n" src;
     Printf.fprintf out "local ffi = require(\"ffi\")\n\n";
     Printf.fprintf out "ffi.cdef([[\n";
+    (* Emit struct definitions BEFORE function decls so the decls can
+       reference them by name. *)
+    List.iter (fun s ->
+      if s.fields <> [] then begin
+        Printf.fprintf out "  typedef struct %s {\n" s.sname;
+        List.iter (fun f ->
+          Printf.fprintf out "    %s %s;\n" (c_of f.ftype) f.fname
+        ) s.fields;
+        Printf.fprintf out "  } %s;\n" s.sname
+      end
+    ) structs;
+    if structs <> [] then Printf.fprintf out "\n";
     List.iter (fun fn ->
       Printf.fprintf out "  %s %s(" (c_of fn.ret) fn.name;
       (match fn.params with
@@ -852,9 +971,6 @@ module Emit = struct
     ) fns;
     Printf.fprintf out "]])\n\nlocal C = ffi.C\n\n";
 
-    (* Matches the canonical helper from
-       extern/lua_of_ocaml/example-game/love_runtime.lua —
-       one function for both int-untag and float-unbox. *)
     Printf.fprintf out
       "local function ocaml_val(v)\n\
       \  if type(v) == \"number\" then return v / 2 end\n\
@@ -862,25 +978,41 @@ module Emit = struct
       \  return v\n\
        end\n\n";
 
+    (* Struct constructors. *)
+    let ctors = constructors env smap structs in
+    if ctors <> [] then
+      Printf.fprintf out "-- Struct constructors\n";
+    List.iter (fun (cname, s) ->
+      let params =
+        String.concat ","
+          (List.mapi (fun i _ -> Printf.sprintf "a%d" (i + 1)) s.fields) in
+      let args =
+        String.concat ", "
+          (List.mapi (fun i f ->
+             let aname = Printf.sprintf "a%d" (i + 1) in
+             arg_unwrap env f.ftype aname) s.fields) in
+      Printf.fprintf out
+        "function %s(%s) return { 0, ffi.new(\"%s\", { %s }) } end\n"
+        cname params s.sname args
+    ) ctors;
+    if ctors <> [] then Printf.fprintf out "\n";
+
     Printf.fprintf out
       "-- Wrappers (OCaml external -> C call with value conversion)\n";
     List.iter (fun fn ->
       let lname = snake (strip_prefix prefix fn.name) in
       let n = List.length fn.params in
-      (* parameter list of the Lua wrapper *)
       let params_str =
         if n = 0 then ""
         else
           String.concat ","
             (List.mapi (fun i _ -> Printf.sprintf "a%d" (i + 1)) fn.params)
       in
-      (* arg list passed to the C call, with per-arg conversion *)
       let args_str =
         String.concat ", "
           (List.mapi (fun i p ->
              let aname = Printf.sprintf "a%d" (i + 1) in
-             if needs_unwrap env p.ptype then "ocaml_val(" ^ aname ^ ")"
-             else aname) fn.params)
+             arg_unwrap env p.ptype aname) fn.params)
       in
       let call = Printf.sprintf "C.%s(%s)" fn.name args_str in
       let body = wrap_return env fn.ret call in
@@ -1406,6 +1538,7 @@ let process_c_header header =
   let toks = Lex.tokens source in
   let tops = Parse.parse_unit toks in
   let env = Typ.make_env tops in
+  let smap = Emit.struct_map tops in
 
   let prefix = String.trim !prefix in
 
@@ -1415,10 +1548,13 @@ let process_c_header header =
                   (function Ast.Struct s -> Some s | _ -> None) tops in
   let enums = List.filter_map
                 (function Ast.Enum e -> Some e | _ -> None) tops in
+  let simple_n =
+    List.length (List.filter (Emit.is_simple_struct env smap) structs) in
 
   Printf.eprintf
-    "[C] %d function decls, %d structs, %d enums from %s\n"
-    (List.length fns) (List.length structs) (List.length enums)
+    "[C] %d function decls, %d structs (%d simple), %d enums from %s\n"
+    (List.length fns) (List.length structs) simple_n
+    (List.length enums)
     (Filename.basename header);
 
   let ml_path  = join !out_dir (base ^ "_external.ml") in
@@ -1426,17 +1562,20 @@ let process_c_header header =
   let lua_path = join !out_dir (base ^ "_bindings.lua") in
 
   let oc = open_out ml_path in
-  Emit.write_ml ~env ~prefix ~src:(Filename.basename header) ~fns oc;
+  Emit.write_ml ~env ~smap ~prefix ~src:(Filename.basename header)
+    ~fns ~structs oc;
   close_out oc;
   Printf.printf "Wrote %s\n" ml_path;
 
   let oc = open_out c_path in
-  Emit.write_c ~prefix ~src:(Filename.basename header) ~fns oc;
+  Emit.write_c ~env ~smap ~prefix ~src:(Filename.basename header)
+    ~fns ~structs oc;
   close_out oc;
   Printf.printf "Wrote %s\n" c_path;
 
   let oc = open_out lua_path in
-  Emit.write_lua ~env ~prefix ~src:(Filename.basename header) ~fns oc;
+  Emit.write_lua ~env ~smap ~prefix ~src:(Filename.basename header)
+    ~fns ~structs oc;
   close_out oc;
   Printf.printf "Wrote %s\n" lua_path
 
