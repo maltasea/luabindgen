@@ -2,13 +2,13 @@
 
 all: html
 
-html: luabingen.html
+html: index.html
 
-website: luabingen.html
+website: index.html
 
-luabingen.html: luabingen.md
+index.html: README.md
 	cp ~/work/site_template/style.css style.css
-	pandoc $< --standalone --metadata title="luabingen" --toc --css=style.css -o $@
+	pandoc $< --standalone --metadata title="luabindgen" --toc --css=style.css -o $@
 
 clean:
-	rm -f luabingen.html style.css
+	rm -f index.html style.css
