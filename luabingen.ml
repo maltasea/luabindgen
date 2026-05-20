@@ -298,14 +298,22 @@ module Parse = struct
           advance st
       | _ -> going := false
     done;
-    (* If we haven't accumulated any primitive type words yet, the next
-       identifier is the named-type. *)
+    (* Did we accumulate a real type specifier (something other than just
+       qualifiers like `const`)? *)
+    let type_specifiers =
+      List.filter (fun w ->
+        not (List.mem w
+               ["const"; "volatile"; "static"; "extern"; "inline";
+                "restrict"; "register"; "_Atomic"; "_Noreturn"])
+      ) !words
+    in
     let base =
-      if !words = [] then begin
+      if type_specifiers = [] then begin
+        (* Either nothing collected, or only qualifiers — the next
+           identifier is the named-type. *)
         match peek st with
         | Some (TIdent w) ->
             advance st;
-            (* Allow a single trailing 'const' after a named type *)
             (match peek st with
              | Some (TIdent "const") -> advance st; saw_const := true
              | _ -> ());
@@ -941,22 +949,40 @@ module Emit = struct
      unchanged. The Lua emitter already strips the wrapper before
      passing values to C, so no special handling is needed here. *)
 
-  let write_lua ~env ~smap ~prefix ~src ~fns ~structs out =
+  let write_lua ~env ~smap ~prefix ~lib ~src ~fns ~structs ~tops out =
     Printf.fprintf out "-- Auto-generated from %s\n" src;
     Printf.fprintf out "local ffi = require(\"ffi\")\n\n";
     Printf.fprintf out "ffi.cdef([[\n";
-    (* Emit struct definitions BEFORE function decls so the decls can
-       reference them by name. *)
-    List.iter (fun s ->
-      if s.fields <> [] then begin
-        Printf.fprintf out "  typedef struct %s {\n" s.sname;
-        List.iter (fun f ->
-          Printf.fprintf out "    %s %s;\n" (c_of f.ftype) f.fname
-        ) s.fields;
-        Printf.fprintf out "  } %s;\n" s.sname
-      end
-    ) structs;
-    if structs <> [] then Printf.fprintf out "\n";
+    (* Structs and aliases interleaved in source order — a later struct
+       can have a field of type EarlierAlias, so we can't separate them
+       into two phases. (E.g. `typedef Texture Texture2D;` between the
+       Texture and Font definitions, where Font has a Texture2D field.) *)
+    let any_type = ref false in
+    List.iter (function
+      | Struct s when s.fields <> [] ->
+          any_type := true;
+          Printf.fprintf out "  typedef struct %s {\n" s.sname;
+          List.iter (fun f ->
+            Printf.fprintf out "    %s %s;\n" (c_of f.ftype) f.fname
+          ) s.fields;
+          Printf.fprintf out "  } %s;\n" s.sname
+      | Struct s ->
+          (* Empty struct = forward declaration. Emit as opaque so other
+             types referring to `Foo *` resolve. *)
+          any_type := true;
+          Printf.fprintf out "  typedef struct %s %s;\n" s.sname s.sname
+      | Alias (name, t) ->
+          any_type := true;
+          Printf.fprintf out "  typedef %s %s;\n" (c_of t) name
+      | Callback (name, _, _) ->
+          (* LuaJIT FFI doesn't support va_list and we don't actually
+             round-trip OCaml callbacks through the C side yet, so
+             expose them as opaque void* for now. *)
+          any_type := true;
+          Printf.fprintf out "  typedef void* %s;\n" name
+      | _ -> ()
+    ) tops;
+    if !any_type then Printf.fprintf out "\n";
     List.iter (fun fn ->
       Printf.fprintf out "  %s %s(" (c_of fn.ret) fn.name;
       (match fn.params with
@@ -969,7 +995,11 @@ module Emit = struct
                 else p.pname)) ps);
       Printf.fprintf out ");\n"
     ) fns;
-    Printf.fprintf out "]])\n\nlocal C = ffi.C\n\n";
+    (match lib with
+     | None ->
+         Printf.fprintf out "]])\n\nlocal C = ffi.C\n\n"
+     | Some name ->
+         Printf.fprintf out "]])\n\nlocal C = ffi.load(\"%s\")\n\n" name);
 
     Printf.fprintf out
       "local function ocaml_val(v)\n\
@@ -1678,6 +1708,7 @@ end
 
 let prefix = ref ""
 let out_dir = ref "."
+let lib = ref ""
 let remaining = ref []
 
 let join dir name =
@@ -1703,6 +1734,9 @@ let process_c_header header =
               (function Ast.Fn f -> Some f | _ -> None) tops in
   let structs = List.filter_map
                   (function Ast.Struct s -> Some s | _ -> None) tops in
+  let aliases = List.filter_map
+                  (function Ast.Alias (n, t) -> Some (n, t) | _ -> None)
+                  tops in
   let enums = List.filter_map
                 (function Ast.Enum e -> Some e | _ -> None) tops in
   let simple_n =
@@ -1731,9 +1765,11 @@ let process_c_header header =
   Printf.printf "Wrote %s\n" c_path;
 
   let oc = open_out lua_path in
-  Emit.write_lua ~env ~smap ~prefix ~src:(Filename.basename header)
-    ~fns ~structs oc;
+  let lib_opt = if !lib = "" then None else Some !lib in
+  Emit.write_lua ~env ~smap ~prefix ~lib:lib_opt
+    ~src:(Filename.basename header) ~fns ~structs ~tops oc;
   close_out oc;
+  let _ = aliases in
   Printf.printf "Wrote %s\n" lua_path
 
 let process_lua_source path =
@@ -1773,14 +1809,18 @@ let () =
     [ "--prefix",  Arg.Set_string prefix,
       " Function name prefix to strip (e.g. \"RLAPI \")";
       "--out-dir", Arg.Set_string out_dir,
-      " Directory to write generated files into (default: cwd)" ]
+      " Directory to write generated files into (default: cwd)";
+      "--lib",     Arg.Set_string lib,
+      " Library to ffi.load (default: use ffi.C, which assumes the lib \
+        is already loaded in-process)" ]
     (fun s -> remaining := s :: !remaining)
-    "luabingen [--prefix PREFIX] [--out-dir DIR] <file.h | file.lua>";
+    "luabingen [opts] <file.h | file.lua>";
 
   let args = List.rev !remaining in
   if args = [] then
     (Printf.eprintf
-       "Usage: luabingen [--prefix PREFIX] [--out-dir DIR] <file.h | file.lua>\n";
+       "Usage: luabingen [--prefix PFX] [--out-dir DIR] [--lib NAME] \
+        <file.h | file.lua>\n";
      exit 1);
 
   let input = List.hd args in
