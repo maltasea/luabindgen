@@ -20,7 +20,8 @@ LUAJIT ?= luajit
 STRIP_TOKENS = SDL_DECLSPEC,SDLCALL,SDL_FORCE_INLINE,SDL_INLINE,SDL_NORETURN,_Nullable,_Nonnull,__cdecl,__stdcall,__attribute__
 
 GENERATED = sdl3_merged_external.ml sdl3_merged_stubs.c sdl3_merged_bindings.lua
-OBJS      = sdl3_merged_stubs.o sdl3_merged_external.cmo main.cmo
+OBJS      = sdl3_merged_stubs.o sdl_prelude_stubs.o \
+            sdl3_merged_external.cmo sdl_prelude.cmo main.cmo
 
 .PHONY: all run clean
 all: main.lua
@@ -77,10 +78,16 @@ $(GENERATED) &: $(LUABINGEN) sdl3_merged.h
 sdl3_merged_stubs.o: sdl3_merged_stubs.c
 	$(OCAMLC) -c sdl3_merged_stubs.c
 
+sdl_prelude_stubs.o: sdl_prelude_stubs.c
+	$(OCAMLC) -c sdl_prelude_stubs.c
+
+sdl_prelude.cmo: sdl_prelude.ml sdl3_merged_external.cmo
+	$(OCAMLC) -c sdl_prelude.ml
+
 sdl3_merged_external.cmo: sdl3_merged_external.ml
 	$(OCAMLC) -c sdl3_merged_external.ml
 
-main.cmo: main.ml sdl3_merged_external.cmo
+main.cmo: main.ml sdl3_merged_external.cmo sdl_prelude.cmo
 	$(OCAMLC) -c main.ml
 
 main.byte: $(OBJS)
@@ -90,8 +97,8 @@ main.byte: $(OBJS)
 gen.lua: main.byte
 	LOO_RUNTIME=$(LUO)/runtime/lua $(LUO)/loo.sh main.byte -o gen.lua
 
-main.lua: sdl3_merged_bindings.lua gen.lua
-	cat sdl3_merged_bindings.lua gen.lua > main.lua
+main.lua: sdl3_merged_bindings.lua sdl_prelude.lua gen.lua
+	cat sdl3_merged_bindings.lua sdl_prelude.lua gen.lua > main.lua
 
 run: main.lua
 	$(LUAJIT) main.lua
