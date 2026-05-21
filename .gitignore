@@ -1,6 +1,7 @@
 *.html
 **/memory.txt
 ./extern/
+extern/
 
 # stylesheet copied by `make html` from a machine-local site template
 /style.css
