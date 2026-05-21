@@ -183,15 +183,20 @@ module Lex = struct
 
   let is_digit c = c >= '0' && c <= '9'
 
+  (* Each emitted token is paired with the 1-based source line where
+     it started, so the parser can attribute skip warnings to the
+     header location they came from. *)
   let tokens s =
     let n = String.length s in
     let i = ref 0 in
+    let line = ref 1 in
     let out = ref [] in
-    let push t = out := t :: !out in
+    let push t = out := (t, !line) :: !out in
     while !i < n do
       let c = s.[!i] in
       match c with
-      | ' ' | '\t' | '\n' | '\r' -> incr i
+      | '\n' -> incr line; incr i
+      | ' ' | '\t' | '\r' -> incr i
       | '(' -> push TLParen; incr i
       | ')' -> push TRParen; incr i
       | '{' -> push TLBrace; incr i
@@ -230,14 +235,27 @@ module Parse = struct
 
   exception Stop
 
-  (* Mutable token cursor. Cheap and easy for a recursive-descent
-     parser this small. *)
-  type st = { mutable toks : tok list }
+  (* Mutable token cursor. Each token is paired with the 1-based
+     source line where it started, so warnings about skipped or
+     malformed declarations can point at the right spot. The
+     current line is derived from the head token rather than stored
+     separately — that way `st.toks <- saved` rollbacks don't desync
+     it. *)
+  type st = {
+    mutable toks     : (tok * int) list;
+    mutable warnings : (int * string) list;
+  }
 
-  let peek st = match st.toks with [] -> None | t :: _ -> Some t
-  let advance st = match st.toks with [] -> () | _ :: r -> st.toks <- r
+  let cur_line st =
+    match st.toks with [] -> 0 | (_, l) :: _ -> l
+
+  let warn st msg = st.warnings <- (cur_line st, msg) :: st.warnings
+
+  let peek st = match st.toks with [] -> None | (t, _) :: _ -> Some t
+  let advance st = match st.toks with
+    | [] -> () | _ :: r -> st.toks <- r
   let eat st t = match st.toks with
-    | x :: r when x = t -> st.toks <- r; true
+    | (x, _) :: _ when x = t -> advance st; true
     | _ -> false
 
   (* Skip until (and including) a terminator at brace depth 0. *)
@@ -393,7 +411,7 @@ module Parse = struct
         (* Could be the type "void" of a real param like `void *p`.
            Disambiguate by lookahead. *)
         (match st.toks with
-         | _ :: TRParen :: _ -> advance st; None
+         | _ :: (TRParen, _) :: _ -> advance st; None
          | _ ->
              let t = parse_type st in
              let name = match peek st with
@@ -483,7 +501,8 @@ module Parse = struct
          argument names. *)
       let try_fnptr_field t =
         match st.toks with
-        | TLParen :: TStar :: TIdent name :: TRParen :: TLParen :: _ ->
+        | (TLParen, _) :: (TStar, _) :: (TIdent name, _)
+          :: (TRParen, _) :: (TLParen, _) :: _ ->
             (* consume `( * name ) ( ... ) ;` to the matching `;` *)
             advance st; advance st; advance st; advance st;
             let depth = ref 1 in
@@ -508,7 +527,8 @@ module Parse = struct
          names as fields of the OUTER struct. *)
       let try_anon_aggregate () =
         match st.toks with
-        | TIdent ("struct" | "union") :: TLBrace :: _ ->
+        | (TIdent ("struct" | "union"), _) :: (TLBrace, _) :: _ ->
+            warn st "skipped anonymous union/struct field";
             advance st; advance st;
             let depth = ref 1 in
             while !depth > 0 do
@@ -552,7 +572,7 @@ module Parse = struct
                     | Some TLBrack ->
                         let len =
                           match st.toks with
-                          | _ :: TInt s :: _ ->
+                          | _ :: (TInt s, _) :: _ ->
                               (try Some (int_of_string s)
                                with _ -> None)
                           | _ -> None
@@ -761,7 +781,7 @@ module Parse = struct
              (match try_alias_typedef st with
               | Some a -> [a]
               | None ->
-                  (* give up, skip statement *)
+                  warn st "unrecognized typedef shape (skipped)";
                   skip_until_top st [TSemi]; []))
 
   (* Try to parse a top-level function declaration starting at the
@@ -782,6 +802,7 @@ module Parse = struct
                token was stripped. Skip the body so the lexer doesn't
                interpret `return` etc. as a top-level type. We don't
                bind to inline functions — they have no linker symbol. *)
+            warn st ("skipped inline function body: " ^ name);
             advance st;
             let depth = ref 1 in
             while !depth > 0 do
@@ -797,8 +818,11 @@ module Parse = struct
         end else (st.toks <- saved; advance st; None)
     | _ -> st.toks <- saved; advance st; None
 
+  (* Returns the AST and the warning list (1-based source line +
+     reason). Warnings are best-effort: they cover the parser's known
+     "give up and skip" branches. *)
   let parse_unit toks =
-    let st = { toks } in
+    let st = { toks; warnings = [] } in
     let out = ref [] in
     let going = ref true in
     while !going do
@@ -813,7 +837,8 @@ module Parse = struct
              tag-qualified return type. Look two tokens past the
              tag for a `{` to disambiguate. *)
           (match st.toks with
-           | _ :: TIdent _ :: TLBrace :: _ | _ :: TLBrace :: _ ->
+           | _ :: (TIdent _, _) :: (TLBrace, _) :: _
+           | _ :: (TLBrace, _) :: _ ->
                advance st;
                let (tag, fields) = parse_struct_body st in
                (match tag with
@@ -828,7 +853,8 @@ module Parse = struct
                 | None -> ()))
       | Some (TIdent "enum") ->
           (match st.toks with
-           | _ :: TIdent _ :: TLBrace :: _ | _ :: TLBrace :: _ ->
+           | _ :: (TIdent _, _) :: (TLBrace, _) :: _
+           | _ :: (TLBrace, _) :: _ ->
                advance st;
                let (tag, consts) = parse_enum_body st in
                (* Anonymous top-level enums (`enum { A=1, B=2 };`) are
@@ -851,7 +877,7 @@ module Parse = struct
            | Some d -> out := d :: !out
            | None -> ())
     done;
-    List.rev !out
+    (List.rev !out, List.rev st.warnings)
 end
 
 (* ================================================================== *)
@@ -1637,12 +1663,18 @@ module Lua_lex = struct
   let tokens src =
     let n = String.length src in
     let i = ref 0 in
+    let line = ref 1 in
     let out = ref [] in
-    let push t = out := t :: !out in
+    let push t = out := (t, !line) :: !out in
+    (* Approximate line tracking: counts newlines we step over in the
+       whitespace branch. Long-bracket strings/comments and short
+       strings with embedded newlines aren't fully counted (the body
+       skip doesn't advance `line`); good enough for warning sites. *)
     while !i < n do
       let c = src.[!i] in
       match c with
-      | ' ' | '\t' | '\n' | '\r' -> incr i
+      | '\n' -> incr line; incr i
+      | ' ' | '\t' | '\r' -> incr i
       | '-' when !i + 1 < n && src.[!i + 1] = '-' ->
           (* comment: '--' followed by either long bracket or to EOL *)
           i := !i + 2;
@@ -1740,11 +1772,15 @@ module Lua_parse = struct
   open Lua_ast
 
   type st = {
-    mutable toks : tok list;
+    mutable toks     : (tok * int) list;
+    mutable warnings : (int * string) list;
   }
 
-  let peek st = match st.toks with [] -> None | t :: _ -> Some t
-  let peek2 st = match st.toks with _ :: t :: _ -> Some t | _ -> None
+  let cur_line st = match st.toks with [] -> 0 | (_, l) :: _ -> l
+  let warn st msg = st.warnings <- (cur_line st, msg) :: st.warnings
+
+  let peek st = match st.toks with [] -> None | (t, _) :: _ -> Some t
+  let peek2 st = match st.toks with _ :: (t, _) :: _ -> Some t | _ -> None
   let advance st = match st.toks with [] -> () | _ :: r -> st.toks <- r
 
   (* Skip until we hit something that can't be the continuation of the
@@ -1949,7 +1985,7 @@ module Lua_parse = struct
     | _ -> st.toks <- saved; None
 
   let parse_unit toks =
-    let st = { toks } in
+    let st = { toks; warnings = [] } in
     let out = ref [] in
     let going = ref true in
     while !going do
@@ -1991,7 +2027,7 @@ module Lua_parse = struct
       | Some LSemi -> advance st
       | Some _ -> advance st
     done;
-    List.rev !out
+    (List.rev !out, List.rev st.warnings)
 
   (* Convenience: filter unit to just fn declarations whose path makes
      them a candidate for binding (anything that's `module.fn` or
@@ -2186,7 +2222,7 @@ let strip_tokens raw_toks =
        |> List.concat_map (String.split_on_char ' ')
        |> List.map String.trim);
     List.filter (function
-      | Lex.TIdent w when Hashtbl.mem set w -> false
+      | (Lex.TIdent w, _) when Hashtbl.mem set w -> false
       | _ -> true) raw_toks
 
 let join dir name =
@@ -2214,7 +2250,7 @@ let process_c_header header =
   let source = Pp.run raw in
   let defines = Pp.extract_defines raw in
   let toks = strip_tokens (Lex.tokens source) in
-  let tops = Parse.parse_unit toks in
+  let (tops, warnings) = Parse.parse_unit toks in
   let env = Typ.make_env tops in
   let smap = Emit.struct_map tops in
 
@@ -2312,6 +2348,33 @@ let process_c_header header =
     (List.length enums) (List.length defines)
     (Filename.basename header);
 
+  (* Surface parser skips so silent corruption stops being silent.
+     Group identical messages so a header with 200 function-pointer
+     fields prints one line, not 200. *)
+  (if warnings <> [] then begin
+     let groups = Hashtbl.create 8 in
+     List.iter (fun (line, msg) ->
+       let prev = try Hashtbl.find groups msg with Not_found -> [] in
+       Hashtbl.replace groups msg (line :: prev)
+     ) warnings;
+     Hashtbl.iter (fun msg lines ->
+       let n = List.length lines in
+       let first3 =
+         List.sort_uniq compare lines |> fun ls ->
+         let rec take n = function
+           | _ when n = 0 -> []
+           | [] -> []
+           | x :: r -> x :: take (n - 1) r
+         in
+         take 3 ls
+       in
+       Printf.eprintf "  warn: %s (%d occurrences, lines %s%s)\n"
+         msg n
+         (String.concat "," (List.map string_of_int first3))
+         (if n > 3 then ",..." else "")
+     ) groups
+   end);
+
   let ml_path  = join !out_dir (base ^ "_external.ml") in
   let c_path   = join !out_dir (base ^ "_stubs.c") in
   let lua_path = join !out_dir (base ^ "_bindings.lua") in
@@ -2344,11 +2407,14 @@ let process_lua_source path =
   let raw = really_input_string ic n in
   close_in ic;
   let toks = Lua_lex.tokens raw in
-  let tops = Lua_parse.parse_unit toks in
+  let (tops, warnings) = Lua_parse.parse_unit toks in
   let fns = Lua_parse.public_fns tops in
   let cdefs = Lua_parse.cdef_blocks tops in
   Printf.eprintf "[Lua] %d public fn decls, %d ffi.cdef blocks from %s\n"
     (List.length fns) (List.length cdefs) (Filename.basename path);
+  List.iter (fun (line, msg) ->
+    Printf.eprintf "  warn: %s (line %d)\n" msg line
+  ) warnings;
 
   let ml_path  = join !out_dir (base ^ "_external.ml") in
   let c_path   = join !out_dir (base ^ "_stubs.c") in
