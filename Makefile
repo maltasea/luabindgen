@@ -1,10 +1,13 @@
-.PHONY: all html website clean
+.PHONY: all html website test clean
 
 all: html
 
 html: index.html
 
 website: index.html
+
+test:
+	@sh tests/run.sh
 
 index.html: README.md
 	cp ~/work/site_template/style.css style.css

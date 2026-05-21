@@ -1129,10 +1129,16 @@ module Emit = struct
      hex literals (good enough for raylib.h's enums). Anything more
      complex falls back to "previous + 1" auto-increment. *)
   let parse_int_lit s =
-    (* Strip trailing integer suffixes (u/U, l/L, ll/LL, ul/lu in any
-       order) before passing to int_of_string. Without this, enum
+    (* The enum-value buffer emits tokens space-separated, so a
+       negative literal arrives as "- 1" rather than "-1". Squash
+       internal whitespace before trying int_of_string. Also strip
+       trailing integer suffixes (u/U/l/L) — without this, enum
        values like `0x20u` silently fall back to previous + 1. *)
-    let s = String.trim s in
+    let buf = Buffer.create (String.length s) in
+    String.iter (fun c ->
+      if c <> ' ' && c <> '\t' then Buffer.add_char buf c
+    ) s;
+    let s = Buffer.contents buf in
     let n = String.length s in
     let stop = ref n in
     while !stop > 0 &&
