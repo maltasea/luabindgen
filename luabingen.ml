@@ -706,25 +706,61 @@ module Parse = struct
     match peek st with
     | Some (TIdent "struct") ->
         advance st;
-        let (_tag, fields) = parse_struct_body st in
-        (* the final identifier is the alias name *)
-        let trailing_names = ref [] in
+        let (tag, fields) = parse_struct_body st in
+        (* `typedef struct Foo { ... } Foo, *PFoo, Foo2;` —
+           track whether each trailing name was preceded by a `*`.
+           Pointer aliases become `Alias (name, Ptr (Named TAG))`
+           rather than a struct-by-value alias, so opaque-handle
+           typedefs (`typedef struct Foo *Handle`) work correctly. *)
+        let trailing = ref [] in    (* (name, is_ptr) list *)
+        let pending_ptr = ref false in
         let going = ref true in
         while !going do
           match peek st with
           | Some (TIdent n) ->
               advance st;
-              trailing_names := n :: !trailing_names;
+              trailing := (n, !pending_ptr) :: !trailing;
+              pending_ptr := false;
               (match peek st with
                | Some TComma -> advance st
                | _ -> ())
-          | Some TStar -> advance st
+          | Some TStar -> advance st; pending_ptr := true
           | Some TSemi -> advance st; going := false
           | None -> going := false
           | _ -> advance st
         done;
-        (* For each trailing name, emit a Struct entry. *)
-        List.rev_map (fun n -> Struct { sname = n; fields }) !trailing_names
+        (* Emit:
+             - one Struct {sname=tag; fields} if there's a body, OR
+               one Struct for any non-pointer trailing name when no tag
+             - Alias (name, Ptr (Named base)) for each pointer alias
+             - Struct {sname=name; fields} for each non-pointer alias *)
+        let base_name = match tag with
+          | Some n -> n
+          | None ->
+              (* anonymous struct: use the first non-ptr trailing name
+                 as the canonical tag *)
+              let rec first_struct = function
+                | (n, false) :: _ -> n
+                | _ :: r -> first_struct r
+                | [] -> ""
+              in
+              first_struct (List.rev !trailing)
+        in
+        let body_struct =
+          match tag with
+          | Some _ -> [Struct { sname = base_name; fields }]
+          | None -> []
+        in
+        let extras =
+          List.filter_map (fun (n, is_ptr) ->
+            if is_ptr then Some (Alias (n, Ptr (Named base_name)))
+            else if n = base_name && tag <> None then
+              None  (* `typedef struct Foo {...} Foo;` — body already
+                       emitted a tagged struct; skip the redundant alias *)
+            else Some (Struct { sname = n; fields })
+          ) (List.rev !trailing)
+        in
+        body_struct @ extras
     | Some (TIdent "enum") ->
         advance st;
         let (_tag, consts) = parse_enum_body st in
@@ -905,16 +941,22 @@ module Typ = struct
       | Fn _ -> ()) tops;
     h
 
-  let rec resolve env t =
-    match t with
-    | Named n ->
-        (match Hashtbl.find_opt env n with
-         | Some (KAlias t') -> resolve env t'
-         | _ -> t)
-    | Const t' -> Const (resolve env t')
-    | Ptr t'   -> Ptr (resolve env t')
-    | Array (t', n) -> Array (resolve env t', n)
-    | _ -> t
+  (* Cycle-aware alias resolution. A self-alias (`typedef Foo Foo;`)
+     or a longer cycle previously caused infinite recursion; we now
+     stop at the first repeat and return the named type as-is. *)
+  let resolve env t =
+    let rec go seen t =
+      match t with
+      | Named n when List.mem n seen -> t
+      | Named n ->
+          (match Hashtbl.find_opt env n with
+           | Some (KAlias t') -> go (n :: seen) t'
+           | _ -> t)
+      | Const t' -> Const (go seen t')
+      | Ptr t'   -> Ptr (go seen t')
+      | Array (t', n) -> Array (go seen t', n)
+      | _ -> t
+    in go [] t
 
   (* CamelCase / PascalCase -> snake_case. Kept here (rather than in
      Emit) because ocaml_of needs it for the OCaml type name of a
@@ -938,6 +980,10 @@ module Typ = struct
 
   (* Map a (resolved) ctype to its OCaml external type. A struct becomes
      an abstract OCaml type named after the struct (snake-cased). *)
+  (* `resolve` already follows alias chains (cycle-safe). After it,
+     any Named n we see is either a struct, enum, callback, or an
+     unknown / cycle-broken name. Don't recurse through KAlias again
+     here — resolve handled it. *)
   let rec ocaml_of env t =
     match resolve env t with
     | Void -> "unit"
@@ -954,7 +1000,9 @@ module Typ = struct
          | Some KEnum -> "int"
          | Some KStruct -> snake n
          | Some KCallback -> "int"
-         | Some (KAlias t') -> ocaml_of env t'
+         (* resolve already collapsed alias chains; if we still see
+            KAlias here it's a cycle — fall back to opaque int *)
+         | Some (KAlias _) -> "int"
          | None -> "int")
 
 end
@@ -998,7 +1046,10 @@ module Emit = struct
                       (fun f -> is_simple_type env smap (n :: seen) f.ftype)
                       s.fields
                 | None -> false)
-           | Some (Typ.KAlias t') -> is_simple_type env smap seen t'
+           (* push n onto seen so alias chains can't loop forever
+              (e.g. `typedef Foo Foo;`) *)
+           | Some (Typ.KAlias t') ->
+               is_simple_type env smap (n :: seen) t'
            | Some Typ.KCallback -> false
            | None -> false)
 
@@ -1175,17 +1226,186 @@ module Emit = struct
     try Some (int_of_string s)
     with _ -> None
 
-  let enum_values e =
+  (* Tiny integer-constant-expression evaluator for enum values that
+     aren't bare literals. Supports the operators C headers actually
+     use for bit-flag enums: << >> | & ^ + - ~ unary-minus, parens,
+     and references to earlier enum constants in the same enum.
+
+     Anything outside that subset returns None — callers then warn
+     instead of silently falling back to prev + 1. *)
+  let eval_enum_expr ~prior_vals raw =
+    (* The enum-value buffer space-separates tokens (so `1<<3` arrives
+       as `"1 < < 3"`). Squash all whitespace before parsing — no token
+       in our supported subset can contain internal whitespace. *)
+    let buf = Buffer.create (String.length raw) in
+    String.iter (fun c ->
+      if c <> ' ' && c <> '\t' && c <> '\n' && c <> '\r'
+      then Buffer.add_char buf c
+    ) raw;
+    let s = Buffer.contents buf in
+    let n = String.length s in
+    let pos = ref 0 in
+    let peek () = if !pos < n then Some s.[!pos] else None in
+    let skip_ws () =
+      while !pos < n &&
+            (let c = s.[!pos] in
+             c = ' ' || c = '\t' || c = '\n' || c = '\r')
+      do incr pos done
+    in
+    let starts what =
+      let lw = String.length what in
+      !pos + lw <= n && String.sub s !pos lw = what
+    in
+    let read_ident () =
+      let start = !pos in
+      while !pos < n &&
+            (let c = s.[!pos] in
+             (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+             (c >= '0' && c <= '9') || c = '_')
+      do incr pos done;
+      String.sub s start (!pos - start)
+    in
+    let read_number () =
+      let start = !pos in
+      while !pos < n &&
+            (let c = s.[!pos] in
+             (c >= '0' && c <= '9') ||
+             (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||
+             c = 'x' || c = 'X' || c = 'u' || c = 'U' ||
+             c = 'l' || c = 'L')
+      do incr pos done;
+      parse_int_lit (String.sub s start (!pos - start))
+    in
+    let rec primary () =
+      skip_ws ();
+      match peek () with
+      | None -> None
+      | Some '(' ->
+          incr pos;
+          let r = expr () in
+          skip_ws ();
+          (match peek () with Some ')' -> incr pos; r | _ -> None)
+      | Some '-' -> incr pos;
+          (match unary () with Some x -> Some (- x) | None -> None)
+      | Some '~' -> incr pos;
+          (match unary () with Some x -> Some (lnot x) | None -> None)
+      | Some '+' -> incr pos; unary ()
+      | Some c when (c >= '0' && c <= '9') -> read_number ()
+      | Some c when (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                    || c = '_' ->
+          let id = read_ident () in
+          (try Some (List.assoc id prior_vals) with Not_found -> None)
+      | _ -> None
+    and unary () = primary ()
+    and mul_div () =
+      let l = unary () in
+      let rec go l =
+        skip_ws ();
+        match peek () with
+        | Some '*' -> incr pos;
+            (match unary () with
+             | Some r -> (match l with Some x -> go (Some (x * r)) | None -> None)
+             | None -> None)
+        | Some '/' -> incr pos;
+            (match unary () with
+             | Some r when r <> 0 ->
+                 (match l with Some x -> go (Some (x / r)) | None -> None)
+             | _ -> None)
+        | _ -> l
+      in go l
+    and add_sub () =
+      let l = mul_div () in
+      let rec go l =
+        skip_ws ();
+        match peek () with
+        | Some '+' -> incr pos;
+            (match mul_div () with
+             | Some r -> (match l with Some x -> go (Some (x + r)) | None -> None)
+             | None -> None)
+        | Some '-' -> incr pos;
+            (match mul_div () with
+             | Some r -> (match l with Some x -> go (Some (x - r)) | None -> None)
+             | None -> None)
+        | _ -> l
+      in go l
+    and shift () =
+      let l = add_sub () in
+      let rec go l =
+        skip_ws ();
+        if starts "<<" then begin
+          pos := !pos + 2;
+          match add_sub () with
+          | Some r -> (match l with Some x -> go (Some (x lsl r)) | None -> None)
+          | None -> None
+        end else if starts ">>" then begin
+          pos := !pos + 2;
+          match add_sub () with
+          | Some r -> (match l with Some x -> go (Some (x asr r)) | None -> None)
+          | None -> None
+        end else l
+      in go l
+    and bit_and () =
+      let l = shift () in
+      let rec go l =
+        skip_ws ();
+        match peek () with
+        | Some '&' ->
+            incr pos;
+            (match shift () with
+             | Some r -> (match l with Some x -> go (Some (x land r)) | None -> None)
+             | None -> None)
+        | _ -> l
+      in go l
+    and bit_xor () =
+      let l = bit_and () in
+      let rec go l =
+        skip_ws ();
+        match peek () with
+        | Some '^' ->
+            incr pos;
+            (match bit_and () with
+             | Some r -> (match l with Some x -> go (Some (x lxor r)) | None -> None)
+             | None -> None)
+        | _ -> l
+      in go l
+    and bit_or () =
+      let l = bit_xor () in
+      let rec go l =
+        skip_ws ();
+        match peek () with
+        | Some '|' ->
+            incr pos;
+            (match bit_xor () with
+             | Some r -> (match l with Some x -> go (Some (x lor r)) | None -> None)
+             | None -> None)
+        | _ -> l
+      in go l
+    and expr () = bit_or ()
+    in
+    let r = expr () in
+    skip_ws ();
+    if !pos = n then r else None
+
+  let enum_values ?(warn=ignore) e =
+    let prior = ref [] in
     let prev = ref (-1) in
     List.map (fun (name, raw) ->
       let v = match raw with
+        | None -> !prev + 1
         | Some s ->
             (match parse_int_lit s with
              | Some n -> n
-             | None -> !prev + 1)
-        | None -> !prev + 1
+             | None ->
+                 match eval_enum_expr ~prior_vals:!prior s with
+                 | Some n -> n
+                 | None ->
+                     warn (Printf.sprintf
+                       "enum %s.%s: couldn't evaluate `%s`, using prev+1"
+                       e.ename name (String.trim s));
+                     !prev + 1)
       in
       prev := v;
+      prior := (name, v) :: !prior;
       (name, v)
     ) e.consts
 
@@ -1218,12 +1438,13 @@ module Emit = struct
         Printf.fprintf out "let %s = %d\n" oname v
     in
     List.iter (fun e ->
-      List.iter (fun (name, v) -> emit_const name v) (enum_values e)
+      List.iter (fun (name, v) -> emit_const name v) (enum_values ~warn:(Printf.eprintf "  warn: %s\n") e)
     ) enums;
     (* #define NAME <int> constants, deduplicated against enum-defined
        names (an enum constant with the same name takes precedence). *)
     let seen = Hashtbl.create 64 in
     List.iter (fun e ->
+      (* second pass — silent, the first pass already warned *)
       List.iter (fun (n, _) -> Hashtbl.replace seen (snake n) ()) (enum_values e)
     ) enums;
     List.iter (fun (name, v) ->
@@ -1462,7 +1683,27 @@ module Emit = struct
      | None ->
          Printf.fprintf out "]])\n\nlocal C = ffi.C\n\n"
      | Some name ->
-         Printf.fprintf out "]])\n\nlocal C = ffi.load(\"%s\")\n\n" name);
+         (* Escape backslash, quote, and control chars in case --lib
+            gets a name with weird punctuation. Quote-and-backslash
+            escaping is enough for Lua short string literals;
+            embedded control chars get hex escapes. *)
+         let escaped =
+           let buf = Buffer.create (String.length name + 2) in
+           String.iter (fun c ->
+             match c with
+             | '\\' -> Buffer.add_string buf "\\\\"
+             | '"'  -> Buffer.add_string buf "\\\""
+             | '\n' -> Buffer.add_string buf "\\n"
+             | '\r' -> Buffer.add_string buf "\\r"
+             | '\t' -> Buffer.add_string buf "\\t"
+             | c when Char.code c < 32 ->
+                 Buffer.add_string buf
+                   (Printf.sprintf "\\x%02x" (Char.code c))
+             | c -> Buffer.add_char buf c
+           ) name;
+           Buffer.contents buf
+         in
+         Printf.fprintf out "]])\n\nlocal C = ffi.load(\"%s\")\n\n" escaped);
 
     Printf.fprintf out
       "local function ocaml_val(v)\n\
@@ -2015,11 +2256,17 @@ module Lua_parse = struct
                skip_expr st;
                (match peek st with Some LSemi -> advance st | _ -> ()))
       | Some (LKw ("if" | "for" | "while" | "do" | "repeat")) ->
-          (* Skip top-level control blocks. (LÖVE wrap files don't
-             define bindable functions inside these, but if they ever
-             do, this is the seam to descend into instead of skipping.) *)
-          advance st;
-          skip_block_to_end st
+          (* Descend into control blocks rather than skipping them
+             wholesale. A `function love.foo()` defined inside
+             `if jit then ... else ... end` is still part of the
+             public API. The opener + its condition tokens get
+             consumed (skip_expr stops at the matching `then` / `do`);
+             body statements parse via the next loop iterations; the
+             matching `then`/`else`/`elseif`/`end`/`until` close
+             tokens are just advanced past below. *)
+          advance st
+      | Some (LKw ("then" | "else" | "elseif" | "end" | "until" | "in")) ->
+          advance st
       | Some (LKw "return") ->
           advance st;
           skip_expr st;

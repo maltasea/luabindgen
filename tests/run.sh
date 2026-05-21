@@ -30,6 +30,18 @@ gen() {
     }
 }
 
+# Same as gen but the heredoc is treated as Lua input.
+gen_lua() {
+  local base="$1"; shift
+  cat > "$TMP/$base.lua"
+  ocaml -I +str str.cma "$LB" --out-dir "$TMP" "$@" "$TMP/$base.lua" \
+    >"$TMP/$base.gen.log" 2>&1 || {
+      echo "  FAIL: generator crashed; see $TMP/$base.gen.log"
+      FAIL=$((FAIL + 1))
+      return 1
+    }
+}
+
 # Assert a regex matches somewhere in the named output file.
 expect() {
   local kind="$1"   # ml | c | lua
@@ -202,6 +214,62 @@ gen lib_flag_named --lib MyLib <<'EOF'
 void f(void);
 EOF
 expect lua lib_flag_named 'local C = ffi\.load\("MyLib"\)'
+
+start "--lib name with quotes/backslashes is escaped"
+gen lib_evil --lib 'evil"name\with' <<'EOF'
+void f(void);
+EOF
+expect lua lib_evil 'ffi\.load\("evil\\"name\\\\with"\)'
+
+# ----------------------------------------------------------------------
+# fixes from the second report-gpt.md (2026-05-21)
+# ----------------------------------------------------------------------
+
+start "typedef struct Foo *Handle becomes a pointer alias"
+gen ptr_alias <<'EOF'
+typedef struct Foo *FooHandle;
+FooHandle GetFoo(void);
+void UseFoo(FooHandle h);
+EOF
+# The OCaml side: Foo is a struct (abstract type), FooHandle resolves
+# to Ptr (Named Foo) -> "int" in our mapping; no `make_foo_handle`,
+# no struct-by-value wrapping in the Lua wrappers.
+expect ml  ptr_alias '^type foo'
+expect ml  ptr_alias '^external get_foo : unit -> int'
+expect ml  ptr_alias '^external use_foo : int -> unit'
+refute ml  ptr_alias '^type foo_handle'
+expect lua ptr_alias 'typedef Foo \* FooHandle;'
+expect lua ptr_alias 'function get_foo\(\) return C\.GetFoo\(\) end'
+expect lua ptr_alias 'function use_foo\(a1\) C\.UseFoo\(a1\); return end'
+
+start "enum bit-flag expressions evaluate (1 << 3, etc.)"
+gen enum_expr <<'EOF'
+enum { FLAG_A = 1 << 3, FLAG_B, FLAG_C = FLAG_A | 4 };
+EOF
+expect ml enum_expr '^let flag_a = 8$'
+expect ml enum_expr '^let flag_b = 9$'
+expect ml enum_expr '^let flag_c = 12$'
+
+start "self-referential alias terminates (no hang)"
+# This one didn't terminate at all before the resolve cycle fix —
+# the test will time out if it regresses. Wrap with a 5s deadline.
+gen cycle <<'EOF'
+typedef int Foo;
+typedef Foo Foo;
+Foo f(void);
+EOF
+expect ml cycle '^external f :'
+
+start 'Lua: public functions inside an if/else block'
+gen_lua cond <<'EOF'
+if jit then
+  function love.math.random(a) return a end
+else
+  function love.math.random(a) return a + 1 end
+end
+EOF
+# Both branches define love.math.random; the deduper keeps one.
+expect ml cond '^external love_math_random :'
 
 # ----------------------------------------------------------------------
 # smoke test: bundled raylib header parses & emits expected counts
