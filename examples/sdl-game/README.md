@@ -2,8 +2,9 @@
 
 End-to-end demo: OCaml → bytecode → lua_of_ocaml → luajit → libSDL3.
 
-Opens an SDL3 window, holds it for 2 seconds, exits. Proves luabindgen
-can drive a second well-known C library beyond raylib.
+Opens an SDL3 window, attaches a renderer, animates a clear color, exits
+when you close the window. Proves luabindgen can drive a second
+well-known C library beyond raylib.
 
 ## requires
 
@@ -25,9 +26,34 @@ make run
 
 | file | role |
 |---|---|
-| `main.ml`  | the demo |
-| `Makefile` | pipeline + curated header list |
-| `README.md` | this file |
+| `main.ml`             | the demo |
+| `Makefile`            | pipeline + curated header list |
+| `sdl_prelude.lua`     | hand-written glue (NULL string, event alloc, event.type) |
+| `sdl_prelude.ml`      | OCaml externals matching `sdl_prelude.lua` |
+| `sdl_prelude_stubs.c` | linker placeholders for the prelude externals |
+| `README.md`           | this file |
+
+## the per-example prelude
+
+luabindgen can't yet auto-generate three things SDL3 needs for a real
+interactive demo:
+
+1. **NULL pointer args** — `SDL_CreateRenderer(window, NULL)` for the
+   default driver. We can't pass nil through OCaml's `string` type.
+2. **Caller-allocated structs** — `SDL_PollEvent(SDL_Event *event)`
+   writes to a struct the caller provides. luabindgen has no
+   `alloc_X` constructor for opaque-by-API types.
+3. **Reading union fields** — `event.type` lives in a union we
+   skipped at parse time.
+
+`sdl_prelude.{lua,ml,stubs.c}` is hand-written glue for those gaps —
+the same pattern lua_of_ocaml uses in
+`extern/lua_of_ocaml/example-game/love_runtime.lua`. About 30 lines
+total. The Makefile cats the prelude lua after the generated
+bindings and links the prelude `.cmo` / `.o` alongside the generated
+ones. `sdl_prelude.ml` `open`s the generated module so its shadowing
+`sdl_poll_event : sdl_event -> bool` wins over the generator's
+`int -> bool`.
 
 ## SDL3 quirks that surfaced
 
@@ -66,20 +92,24 @@ didn't touch:
   we can't evaluate. Same for MSVC `__debugbreak` in SDL_assert.h.
   The Makefile uses a curated header list rather than `*.h`.
 
-## what's not here
+## what's still rough
 
-This is "open a window, hold it, exit." A real game using these
-bindings would need:
+The prelude covers the three immediate gaps for this demo, but the
+underlying generator limits remain:
 
-- **NULL pointer passing** — `SDL_CreateRenderer(window, NULL)`
-  for the default renderer. No clean way to express NULL through
-  our `string` argument convention yet.
-- **Output-parameter struct allocation** — `SDL_PollEvent(SDL_Event
-  *event)` writes an event to caller-allocated storage. No way to
-  allocate an SDL_Event on the OCaml side and read its fields back
-  after the call.
-- **Struct field accessors for `unions`** — anonymous unions in
-  events would need bespoke modeling.
+- **NULL pointer passing** — should be expressible without a
+  per-binding helper. An OCaml `option`-typed wrapper in the
+  generator (`string option` instead of `string`) would do it
+  cleanly.
+- **Output-parameter struct allocation** — the prelude allocates an
+  `LB_SDL_Event` stand-in because we don't know `SDL_Event`'s real
+  size. A real `--with-unions` pass that models C unions would
+  remove the need.
+- **Anonymous-union field access** — `event.key.scancode` etc.
+  can't be reached. The variant types (`SDL_KeyboardEvent`,
+  `SDL_MouseButtonEvent`, …) are parsed but the anonymous-union
+  field that holds them is skipped.
 
 These are real gaps; the platformer doesn't hit them because raylib
-returns Vector2/Color by value and uses no callbacks.
+returns Vector2/Color by value, uses no caller-allocated output
+structs, and has no union types in its hot path.
