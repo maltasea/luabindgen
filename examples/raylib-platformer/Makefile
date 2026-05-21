@@ -3,9 +3,12 @@
 ## Requires OCaml 5.4.x (system switch on this machine) so the bytecode
 ## magic (Caml1999X036) matches what the bundled loo binary expects.
 
-LUABINGEN = ../../luabingen.ml
-LUO       = ../../extern/lua_of_ocaml
-RAYLIB_H  = /usr/local/Cellar/raylib/5.5/include/raylib.h
+# Resolve paths relative to this Makefile so `make -C examples/...`
+# and shells with a different cwd both work.
+THIS_DIR  := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+LUABINGEN := $(abspath $(THIS_DIR)/../../luabingen.ml)
+LUO       := $(abspath $(THIS_DIR)/../../extern/lua_of_ocaml)
+RAYLIB_H  ?= /usr/local/Cellar/raylib/5.5/include/raylib.h
 
 OCAMLC ?= ocamlc
 LUAJIT ?= luajit
@@ -40,8 +43,8 @@ main.byte: $(OBJS)
 gen.lua: main.byte
 	LOO_RUNTIME=$(LUO)/runtime/lua $(LUO)/loo.sh main.byte -o gen.lua
 
-main.lua: missing_runtime.lua raylib_bindings.lua gen.lua
-	cat missing_runtime.lua raylib_bindings.lua gen.lua > main.lua
+main.lua: raylib_bindings.lua gen.lua
+	cat raylib_bindings.lua gen.lua > main.lua
 
 run: main.lua
 	$(LUAJIT) main.lua

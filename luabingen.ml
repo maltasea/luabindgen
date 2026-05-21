@@ -876,6 +876,37 @@ module Emit = struct
       else None
     ) structs
 
+  (* Per-field accessor name: <struct>_<field> in snake_case. Field
+     names are already snake_case in C; just normalize structs. *)
+  let accessor_name s f =
+    snake s.sname ^ "_" ^ snake f.fname
+
+  (* All struct field accessors, in the order their structs appear.
+     Emitted for any struct that has fields — even complex ones, since
+     reading e.g. `image_width` is still useful even though Image as a
+     whole has a `void *data` field that keeps it from being
+     constructible.
+
+     Skips an accessor if it would collide with a function name in
+     `fns` (snake-cased, prefix-stripped). Raylib has e.g. an
+     `ImageMipmaps` function AND an `Image.mipmaps` field — both would
+     snake to `image_mipmaps`; we prefer the function. *)
+  let accessors ~prefix ~fns structs =
+    let fn_names = Hashtbl.create 64 in
+    List.iter (fun fn ->
+      Hashtbl.replace fn_names
+        (snake (strip_prefix prefix fn.name)) ()
+    ) fns;
+    List.concat_map (fun s ->
+      if s.fields = [] then []
+      else
+        List.filter_map (fun f ->
+          let n = accessor_name s f in
+          if Hashtbl.mem fn_names n then None
+          else Some (n, s, f)
+        ) s.fields
+    ) structs
+
   (* Parse a raw enum-value expression. We only handle plain decimal and
      hex literals (good enough for raylib.h's enums). Anything more
      complex falls back to "previous + 1" auto-increment. *)
@@ -938,6 +969,14 @@ module Emit = struct
     ) (constructors env smap structs);
     if constructors env smap structs <> []
     then Printf.fprintf out "\n";
+    (* Field accessors: one external per struct field. Lets OCaml read
+       fields of struct values returned by C, e.g. (vector2_x pos). *)
+    let accs = accessors ~prefix ~fns structs in
+    List.iter (fun (aname, s, f) ->
+      Printf.fprintf out "external %s : %s -> %s = \"%s\"\n"
+        aname (snake s.sname) (Typ.ocaml_of env f.ftype) aname
+    ) accs;
+    if accs <> [] then Printf.fprintf out "\n";
     (* Function externals. *)
     List.iter (fun fn ->
       let lname = snake (strip_prefix prefix fn.name) in
@@ -969,6 +1008,12 @@ module Emit = struct
         Printf.fprintf out "(void)v%d; " (i + 1)) s.fields;
       Printf.fprintf out "return Val_int(0); }\n"
     ) (constructors env smap structs);
+    (* Accessor stubs (also never executed). *)
+    List.iter (fun (aname, _s, _f) ->
+      Printf.fprintf out
+        "CAMLprim value %s(value v1) { (void)v1; return Val_int(0); }\n"
+        aname
+    ) (accessors ~prefix ~fns structs);
     List.iter (fun fn ->
       let lname = snake (strip_prefix prefix fn.name) in
       Printf.fprintf out "CAMLprim value %s(" lname;
@@ -1071,6 +1116,18 @@ module Emit = struct
         cname params s.sname args
     ) ctors;
     if ctors <> [] then Printf.fprintf out "\n";
+
+    (* Field accessors: unwrap struct block, access field, re-tag based
+       on the field's C type. Reuses wrap_return so int -> *2, float ->
+       {253,v}, nested struct -> {0,cdata}, etc. *)
+    let accs = accessors ~prefix ~fns structs in
+    if accs <> [] then Printf.fprintf out "-- Field accessors\n";
+    List.iter (fun (aname, _s, f) ->
+      let expr = Printf.sprintf "a1[2].%s" f.fname in
+      let body = wrap_return env f.ftype expr in
+      Printf.fprintf out "function %s(a1) %s end\n" aname body
+    ) accs;
+    if accs <> [] then Printf.fprintf out "\n";
 
     Printf.fprintf out
       "-- Wrappers (OCaml external -> C call with value conversion)\n";

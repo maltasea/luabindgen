@@ -130,6 +130,16 @@ let draw_player () =
   draw_rectangle ex       (y + 6) 2 3 eye_col;
   draw_rectangle (ex + 5) (y + 6) 2 3 eye_col
 
+(* Mouse-follow dot — exercises a struct-by-value return (Vector2 from
+   GetMousePosition) and the generated vector2_x / vector2_y field
+   accessors that turn it into OCaml floats. *)
+let draw_mouse_dot () =
+  let m = get_mouse_position () in
+  let mx = int_of_float (vector2_x m) in
+  let my = int_of_float (vector2_y m) in
+  draw_circle mx my 5.0 (make_color 255 255 255 200);
+  draw_circle mx my 2.0 (make_color  40  40  40 255)
+
 let draw_hud () =
   draw_fps 8 8;
   draw_text "<- -> to move, space to jump" 8 (win_h - 22) 14
@@ -146,6 +156,7 @@ let draw () =
   draw_ground ();
   Array.iter draw_platform platforms;
   draw_player ();
+  draw_mouse_dot ();
   draw_hud ();
   end_drawing ()
 

@@ -44,27 +44,24 @@ full luabindgen pipeline drives raylib.
 |---|---|
 | `main.ml`             | gameplay + render. 120-ish lines |
 | `Makefile`            | the full pipeline |
-| `missing_runtime.lua` | a shim — see below |
 | `README.md`           | this file |
 | `.gitignore`          | ignores everything generated at build time |
 
-## the `missing_runtime.lua` shim
+## runtime dependency
 
-lua_of_ocaml's code generator emits calls to `caml_mkclosure(arity,
-fn)` to wrap closures, but the runtime (`extern/lua_of_ocaml/runtime/lua/`)
-doesn't define `caml_mkclosure`. The first OCaml closure call then
-hits `caml_call_gen`, which does `f.arity` on the result and crashes
-because `f` ended up as a number.
-
-This file defines `caml_mkclosure` as a callable table with an
-`arity` field:
+Requires `caml_mkclosure` in `extern/lua_of_ocaml/runtime/lua/stdlib.lua`.
+The lua_of_ocaml code generator emits `caml_mkclosure(arity, fn)` to
+wrap closures, but historically the runtime didn't define it — the
+first OCaml closure call would then crash inside `caml_call_gen` doing
+`f.arity` on a number. This repo's vendored lua_of_ocaml has the fix:
 
     function caml_mkclosure(arity, fn)
       return setmetatable({arity = arity},
         { __call = function(_, ...) return fn(...) end })
     end
 
-Probably belongs upstream in `extern/lua_of_ocaml/runtime/lua/stdlib.lua`.
+If you're running against an older lua_of_ocaml that doesn't have it,
+add the function to `runtime/lua/stdlib.lua` before building.
 
 ## how `main.ml` uses the bindings
 
