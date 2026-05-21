@@ -5,6 +5,9 @@ sdl3_merged_external.cmo
 sdl3_merged_stubs.c
 sdl3_merged_stubs.o
 sdl3_merged_bindings.lua
+sdl_prelude.cmi
+sdl_prelude.cmo
+sdl_prelude_stubs.o
 main.cmi
 main.cmo
 main.byte
