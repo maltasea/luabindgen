@@ -41,8 +41,10 @@ Options:
     ocaml -I +str str.cma luabingen.ml \
       --prefix "RLAPI" --lib raylib --out-dir gen extern/raylib-6.0/src/raylib.h
 
-For raylib.h: 581 function decls, 36 structs (20 with auto-generated
-constructors), 22 enums (300 constants).
+For `extern/raylib-6.0/src/raylib.h`: 600 function decls, 37 structs
+(20 with auto-generated constructors), 22 enums (305 constants).
+(The brew `/usr/local/Cellar/raylib/5.5/include/raylib.h` gives 581 /
+36 / 22 / 300; counts drift between raylib versions.)
 
 C type → OCaml side:
 

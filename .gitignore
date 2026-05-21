@@ -1,3 +1,14 @@
 *.html
 **/memory.txt
 ./extern/
+
+# stylesheet copied by `make html` from a machine-local site template
+/style.css
+
+# loose generated test artifacts at the repo root
+/raylib_external.ml
+/raylib_stubs.c
+/raylib_bindings.lua
+
+# claude session notes / external review drafts
+/report-*.md

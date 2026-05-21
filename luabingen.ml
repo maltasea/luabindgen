@@ -1817,7 +1817,18 @@ let join dir name =
   if dir = "" || dir = "." then name
   else Filename.concat dir name
 
+(* Create the output directory (with intermediate dirs) if it doesn't
+   exist already. Delegates to /bin/mkdir -p so we don't have to walk
+   the path ourselves; Filename.quote keeps it shell-safe. *)
+let ensure_dir dir =
+  if dir <> "" && dir <> "." && not (Sys.file_exists dir) then
+    let cmd = Printf.sprintf "mkdir -p %s" (Filename.quote dir) in
+    if Sys.command cmd <> 0 then
+      (Printf.eprintf "luabingen: failed to create out-dir %s\n" dir;
+       exit 1)
+
 let process_c_header header =
+  ensure_dir !out_dir;
   let base = Filename.chop_extension (Filename.basename header) in
   let ic = open_in header in
   let n = in_channel_length ic in
@@ -1875,6 +1886,7 @@ let process_c_header header =
   Printf.printf "Wrote %s\n" lua_path
 
 let process_lua_source path =
+  ensure_dir !out_dir;
   let base = Filename.chop_extension (Filename.basename path) in
   let ic = open_in path in
   let n = in_channel_length ic in
