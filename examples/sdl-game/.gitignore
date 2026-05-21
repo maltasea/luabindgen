@@ -1,0 +1,12 @@
+sdl3_merged.h
+sdl3_merged_external.ml
+sdl3_merged_external.cmi
+sdl3_merged_external.cmo
+sdl3_merged_stubs.c
+sdl3_merged_stubs.o
+sdl3_merged_bindings.lua
+main.cmi
+main.cmo
+main.byte
+gen.lua
+main.lua

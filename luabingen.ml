@@ -121,6 +121,40 @@ module Pp = struct
     Buffer.contents buf
 
   let run s = strip_pp (strip_comments s)
+
+  (* Extract `#define NAME <int-literal>` constants for the emitter.
+     Only simple single-token integer literals are recognized — hex
+     (0x...), decimal, with optional integer suffix (u, U, l, L, ll,
+     LL, in any combo). Anything more complex (referencing other
+     macros, expressions, strings, function-style macros) is skipped.
+
+     Operates on the cleaned text (comments removed) so trailing
+     comments don't confuse the regex. *)
+  let extract_defines s =
+    let s = strip_comments s in
+    let re = Str.regexp
+      "^[ \t]*#[ \t]*define[ \t]+\\([A-Za-z_][A-Za-z_0-9]*\\)[ \t]+\
+       \\(-?\\(0[xX][0-9A-Fa-f]+\\|[0-9]+\\)[uUlL]*\\)[ \t]*$" in
+    let out = ref [] in
+    List.iter (fun line ->
+      if Str.string_match re line 0 then begin
+        let name = Str.matched_group 1 line in
+        let raw  = Str.matched_group 2 line in
+        let cleaned =
+          let n = String.length raw in
+          let stop = ref n in
+          while !stop > 0 &&
+                let c = raw.[!stop - 1] in
+                c = 'u' || c = 'U' || c = 'l' || c = 'L'
+          do decr stop done;
+          String.sub raw 0 !stop
+        in
+        match int_of_string_opt cleaned with
+        | Some v -> out := (name, v) :: !out
+        | None -> ()
+      end
+    ) (String.split_on_char '\n' s);
+    List.rev !out
 end
 
 (* ================================================================== *)
@@ -435,13 +469,69 @@ module Parse = struct
     else begin
       let fields = ref [] in
       let going = ref true in
+      (* Detect a function-pointer field of shape T ( * name )( args );
+         and consume it as a single opaque-pointer field. Without
+         this, the parser falls into its identifier-list branch and
+         starts inventing fields out of the function-pointer's
+         argument names. *)
+      let try_fnptr_field t =
+        match st.toks with
+        | TLParen :: TStar :: TIdent name :: TRParen :: TLParen :: _ ->
+            (* consume `( * name ) ( ... ) ;` to the matching `;` *)
+            advance st; advance st; advance st; advance st;
+            let depth = ref 1 in
+            advance st;  (* the second `(` *)
+            while !depth > 0 do
+              match peek st with
+              | None -> depth := 0
+              | Some TLParen -> advance st; incr depth
+              | Some TRParen -> advance st; decr depth
+              | Some _ -> advance st
+            done;
+            ignore (eat st TSemi);
+            let _ = t in
+            fields := { ftype = Ptr Void; fname = name } :: !fields;
+            true
+        | _ -> false
+      in
+      (* `union { ... } name;` or `struct { ... } name;` as a field —
+         skip the whole declaration. We can't model the alternative
+         layout faithfully through the OCaml/cdata bridge, and falling
+         through would let the loop start treating the inner field
+         names as fields of the OUTER struct. *)
+      let try_anon_aggregate () =
+        match st.toks with
+        | TIdent ("struct" | "union") :: TLBrace :: _ ->
+            advance st; advance st;
+            let depth = ref 1 in
+            while !depth > 0 do
+              match peek st with
+              | None -> depth := 0
+              | Some TLBrace -> advance st; incr depth
+              | Some TRBrace -> advance st; decr depth
+              | Some _ -> advance st
+            done;
+            (* Skip the optional field name(s) and the trailing `;` *)
+            let stop = ref false in
+            while not !stop do
+              match peek st with
+              | None -> stop := true
+              | Some TSemi -> advance st; stop := true
+              | Some _ -> advance st
+            done;
+            true
+        | _ -> false
+      in
       while !going do
         match peek st with
         | Some TRBrace -> advance st; going := false
         | None -> going := false
+        | _ when try_anon_aggregate () -> ()
         | _ ->
             (* Parse one field declaration: type name [, name]* ; *)
             let t = parse_type st in
+            if try_fnptr_field t then ()
+            else
             let going2 = ref true in
             while !going2 do
               match peek st with
@@ -629,10 +719,33 @@ module Parse = struct
           (fun n -> Enum { ename = n; consts })
           !trailing_names
     | Some (TIdent "union") ->
-        (* treat unions like opaque structs to keep things simple *)
+        (* Unions become opaque structs. We can't faithfully model
+           the alternative-layout semantics, but we need *some* type
+           name in scope so that pointer types like `SDL_Event *`
+           resolve in function signatures and field types.
+
+           The trailing identifier list after the body gives us the
+           typedef-aliased names. *)
         advance st;
         let (_tag, _fields) = parse_struct_body st in
-        skip_until_top st [TSemi]; []
+        let trailing_names = ref [] in
+        let going = ref true in
+        while !going do
+          match peek st with
+          | Some (TIdent n) ->
+              advance st;
+              trailing_names := n :: !trailing_names;
+              (match peek st with
+               | Some TComma -> advance st
+               | _ -> ())
+          | Some TStar -> advance st
+          | Some TSemi -> advance st; going := false
+          | None -> going := false
+          | _ -> advance st
+        done;
+        List.rev_map
+          (fun n -> Struct { sname = n; fields = [] })
+          !trailing_names
     | _ ->
         (* Either typedef-of-callback or typedef-of-alias. *)
         (match try_callback_typedef st with
@@ -656,6 +769,23 @@ module Parse = struct
         if eat st TLParen then begin
           let params = parse_param_list st in
           if eat st TSemi then Some (Fn { ret; name; params })
+          else if peek st = Some TLBrace then begin
+            (* Inline function definition (`static inline T fn() { ... }`)
+               leaks through when the SDL_FORCE_INLINE / SDL_INLINE
+               token was stripped. Skip the body so the lexer doesn't
+               interpret `return` etc. as a top-level type. We don't
+               bind to inline functions — they have no linker symbol. *)
+            advance st;
+            let depth = ref 1 in
+            while !depth > 0 do
+              match peek st with
+              | None -> depth := 0
+              | Some TLBrace -> advance st; incr depth
+              | Some TRBrace -> advance st; decr depth
+              | Some _ -> advance st
+            done;
+            None
+          end
           else (st.toks <- saved; advance st; None)
         end else (st.toks <- saved; advance st; None)
     | _ -> st.toks <- saved; advance st; None
@@ -991,7 +1121,7 @@ module Emit = struct
       (name, v)
     ) e.consts
 
-  let write_ml ~env ~smap ~prefix ~src ~fns ~structs ~enums out =
+  let write_ml ~env ~smap ~prefix ~src ~fns ~structs ~enums ~defines out =
     Printf.fprintf out "(* Auto-generated from %s *)\n\n" src;
     (* Abstract type per struct, so signatures can reference them. *)
     List.iter (fun s ->
@@ -1014,14 +1144,27 @@ module Emit = struct
        "new"; "object"; "to"; "downto"; "exception"; "external";
        "try"; "raise"]
     in
+    let emit_const name v =
+      let oname = snake name in
+      if not (List.mem oname ocaml_reserved) then
+        Printf.fprintf out "let %s = %d\n" oname v
+    in
     List.iter (fun e ->
-      List.iter (fun (name, v) ->
-        let oname = snake name in
-        if not (List.mem oname ocaml_reserved) then
-          Printf.fprintf out "let %s = %d\n" oname v
-      ) (enum_values e)
+      List.iter (fun (name, v) -> emit_const name v) (enum_values e)
     ) enums;
-    if enums <> [] then Printf.fprintf out "\n";
+    (* #define NAME <int> constants, deduplicated against enum-defined
+       names (an enum constant with the same name takes precedence). *)
+    let seen = Hashtbl.create 64 in
+    List.iter (fun e ->
+      List.iter (fun (n, _) -> Hashtbl.replace seen (snake n) ()) (enum_values e)
+    ) enums;
+    List.iter (fun (name, v) ->
+      if not (Hashtbl.mem seen (snake name)) then begin
+        Hashtbl.add seen (snake name) ();
+        emit_const name v
+      end
+    ) defines;
+    if enums <> [] || defines <> [] then Printf.fprintf out "\n";
     (* Constructors for simple structs. *)
     List.iter (fun (cname, s) ->
       let arg_types =
@@ -1106,44 +1249,134 @@ module Emit = struct
     Printf.fprintf out "-- Auto-generated from %s\n" src;
     Printf.fprintf out "local ffi = require(\"ffi\")\n\n";
     Printf.fprintf out "ffi.cdef([[\n";
-    (* Structs and aliases interleaved in source order — a later struct
-       can have a field of type EarlierAlias, so we can't separate them
-       into two phases. (E.g. `typedef Texture Texture2D;` between the
-       Texture and Font definitions, where Font has a Texture2D field.) *)
+    (* Two-pass emit for cross-header dependencies (SDL3's headers
+       reference each other's types regardless of file ordering):
+
+         Pass 1 — forward declarations of every named type:
+           - `typedef struct S S;` for every struct (whether it has
+             a body or not)
+           - `typedef int E;` for every enum
+           - `typedef void* C;` for every typedef'd callback
+           - aliases in source order (so chains resolve)
+
+         Pass 2 — struct bodies in source order, so a struct that
+         has another struct by-value as a field gets the inner one
+         defined first when both come from the same header.
+
+       Within pass 2, fields whose type names the *current* struct
+       get the `struct` tag because the typedef alias isn't visible
+       inside its own body. *)
     let any_type = ref false in
+    (* Pass 1a: forward struct declarations. *)
     List.iter (function
-      | Struct s when s.fields <> [] ->
-          any_type := true;
-          Printf.fprintf out "  typedef struct %s {\n" s.sname;
-          List.iter (fun f ->
-            (* Arrays are written with the [N] suffix in field position,
-             not as a pointer — that's how C declares them and what
-             ffi.cdef expects for inline struct layout. *)
-          (match f.ftype with
-           | Array (inner, Some n) ->
-               Printf.fprintf out "    %s %s[%d];\n" (c_of inner) f.fname n
-           | Array (inner, None) ->
-               Printf.fprintf out "    %s %s[];\n" (c_of inner) f.fname
-           | _ ->
-               Printf.fprintf out "    %s %s;\n" (c_of f.ftype) f.fname)
-          ) s.fields;
-          Printf.fprintf out "  } %s;\n" s.sname
       | Struct s ->
-          (* Empty struct = forward declaration. Emit as opaque so other
-             types referring to `Foo *` resolve. *)
           any_type := true;
           Printf.fprintf out "  typedef struct %s %s;\n" s.sname s.sname
+      | _ -> ()) tops;
+    (* Pass 1b: enum int-aliases. *)
+    List.iter (function
+      | Enum e when e.ename <> "" ->
+          any_type := true;
+          Printf.fprintf out "  typedef int %s;\n" e.ename
+      | _ -> ()) tops;
+    (* Pass 1c: opaque-pointer callback aliases. *)
+    List.iter (function
+      | Callback (name, _, _) ->
+          any_type := true;
+          Printf.fprintf out "  typedef void* %s;\n" name
+      | _ -> ()) tops;
+    (* Pass 1d: typedef aliases in source order. *)
+    List.iter (function
       | Alias (name, t) ->
           any_type := true;
           Printf.fprintf out "  typedef %s %s;\n" (c_of t) name
-      | Callback (name, _, _) ->
-          (* LuaJIT FFI doesn't support va_list and we don't actually
-             round-trip OCaml callbacks through the C side yet, so
-             expose them as opaque void* for now. *)
-          any_type := true;
-          Printf.fprintf out "  typedef void* %s;\n" name
-      | _ -> ()
-    ) tops;
+      | _ -> ()) tops;
+    (* Pass 2: struct bodies, topologically sorted so a struct that has
+       another struct by-value as a field is emitted after the inner
+       one. Pointers and arrays don't need full layout (forward decls
+       suffice), so they don't create dependencies. *)
+    let with_body =
+      List.filter_map
+        (function Struct s when s.fields <> [] -> Some s | _ -> None)
+        tops
+    in
+    let by_name = Hashtbl.create (List.length with_body) in
+    List.iter (fun s -> Hashtbl.replace by_name s.sname s) with_body;
+    (* Field type -> direct by-value struct dependency, if any. *)
+    let rec direct_dep = function
+      | Const t -> direct_dep t
+      | Named n when Hashtbl.mem by_name n -> Some n
+      | _ -> None  (* Ptr / Array / primitive / opaque - no dep *)
+    in
+    let deps s =
+      List.filter_map (fun f -> direct_dep f.ftype) s.fields
+    in
+    (* Iterative Kahn-style topological sort, breaking cycles by
+       emitting in source order. *)
+    let emitted = Hashtbl.create (List.length with_body) in
+    let emit_struct s =
+      let rec c_of_field = function
+        | Named n when n = s.sname -> "struct " ^ n
+        | Const t -> "const " ^ c_of_field t
+        | Ptr t -> c_of_field t ^ " *"
+        | t -> c_of t
+      in
+      Printf.fprintf out "  struct %s {\n" s.sname;
+      List.iter (fun f ->
+        (match f.ftype with
+         | Array (inner, Some n) ->
+             Printf.fprintf out "    %s %s[%d];\n"
+               (c_of_field inner) f.fname n
+         | Array (inner, None) ->
+             Printf.fprintf out "    %s %s[];\n"
+               (c_of_field inner) f.fname
+         | _ ->
+             Printf.fprintf out "    %s %s;\n"
+               (c_of_field f.ftype) f.fname)
+      ) s.fields;
+      Printf.fprintf out "  };\n";
+      Hashtbl.replace emitted s.sname ()
+    in
+    let rec visit visiting s =
+      if Hashtbl.mem emitted s.sname then ()
+      else if Hashtbl.mem visiting s.sname then ()  (* cycle break *)
+      else begin
+        Hashtbl.add visiting s.sname ();
+        List.iter (fun dep_name ->
+          match Hashtbl.find_opt by_name dep_name with
+          | Some dep_s -> visit visiting dep_s
+          | None -> ()
+        ) (deps s);
+        Hashtbl.remove visiting s.sname;
+        emit_struct s
+      end
+    in
+    List.iter (fun s -> visit (Hashtbl.create 8) s) with_body;
+    (* Legacy walk (handles nothing now, leaving as a no-op to keep
+       the diff small): *)
+    List.iter (function
+      | Struct s when false && s.fields <> [] ->
+          let rec c_of_field = function
+            | Named n when n = s.sname -> "struct " ^ n
+            | Const t -> "const " ^ c_of_field t
+            | Ptr t -> c_of_field t ^ " *"
+            | t -> c_of t
+          in
+          Printf.fprintf out "  struct %s {\n" s.sname;
+          List.iter (fun f ->
+            (match f.ftype with
+             | Array (inner, Some n) ->
+                 Printf.fprintf out "    %s %s[%d];\n"
+                   (c_of_field inner) f.fname n
+             | Array (inner, None) ->
+                 Printf.fprintf out "    %s %s[];\n"
+                   (c_of_field inner) f.fname
+             | _ ->
+                 Printf.fprintf out "    %s %s;\n"
+                   (c_of_field f.ftype) f.fname)
+          ) s.fields;
+          Printf.fprintf out "  };\n"
+      | _ -> ()) tops;
     if !any_type then Printf.fprintf out "\n";
     List.iter (fun fn ->
       Printf.fprintf out "  %s %s(" (c_of fn.ret) fn.name;
@@ -1195,7 +1428,19 @@ module Emit = struct
     let accs = accessors ~prefix ~fns structs in
     if accs <> [] then Printf.fprintf out "-- Field accessors\n";
     List.iter (fun (aname, _s, f) ->
-      let expr = Printf.sprintf "a1[2].%s" f.fname in
+      (* Lua keywords can't appear after `.`; fall back to bracket
+         access for those. Field names like `function`, `end`, `do`
+         show up in C structs (e.g. SDL_AssertData.function). *)
+      let lua_kw = ["and"; "break"; "do"; "else"; "elseif"; "end";
+                    "false"; "for"; "function"; "goto"; "if"; "in";
+                    "local"; "nil"; "not"; "or"; "repeat"; "return";
+                    "then"; "true"; "until"; "while"] in
+      let access =
+        if List.mem f.fname lua_kw
+        then Printf.sprintf "a1[2][\"%s\"]" f.fname
+        else Printf.sprintf "a1[2].%s" f.fname
+      in
+      let expr = access in
       let body = wrap_return env f.ftype expr in
       Printf.fprintf out "function %s(a1) %s end\n" aname body
     ) accs;
@@ -1883,7 +2128,24 @@ end
 let prefix = ref ""
 let out_dir = ref "."
 let lib = ref ""
+let strip = ref ""
 let remaining = ref []
+
+(* Comma- or whitespace-separated set of identifier tokens to drop
+   from the lex stream before parsing. Useful for ABI-macro spam like
+   SDL3's `SDL_DECLSPEC` and `SDLCALL`, raylib's `RLAPI`, etc. *)
+let strip_tokens raw_toks =
+  if !strip = "" then raw_toks
+  else
+    let set = Hashtbl.create 16 in
+    List.iter
+      (fun w -> if w <> "" then Hashtbl.replace set w ())
+      (String.split_on_char ',' !strip
+       |> List.concat_map (String.split_on_char ' ')
+       |> List.map String.trim);
+    List.filter (function
+      | Lex.TIdent w when Hashtbl.mem set w -> false
+      | _ -> true) raw_toks
 
 let join dir name =
   if dir = "" || dir = "." then name
@@ -1908,29 +2170,75 @@ let process_c_header header =
   close_in ic;
 
   let source = Pp.run raw in
-  let toks = Lex.tokens source in
+  let defines = Pp.extract_defines raw in
+  let toks = strip_tokens (Lex.tokens source) in
   let tops = Parse.parse_unit toks in
   let env = Typ.make_env tops in
   let smap = Emit.struct_map tops in
 
   let prefix = String.trim !prefix in
 
+  (* Deduplicate by emitted name. Header concatenation (used by the
+     SDL example, since SDL.h is just #include's) re-introduces decls
+     from headers that include each other. Last wins so the most
+     specific definition prevails. *)
+  let dedup_by key xs =
+    let total = Hashtbl.create 64 in
+    List.iter (fun x ->
+      let k = key x in
+      Hashtbl.replace total k
+        (1 + (try Hashtbl.find total k with Not_found -> 0))
+    ) xs;
+    let seen = Hashtbl.create 64 in
+    List.filter (fun x ->
+      let k = key x in
+      let i = (try Hashtbl.find seen k with Not_found -> 0) + 1 in
+      Hashtbl.replace seen k i;
+      i = Hashtbl.find total k
+    ) xs
+  in
+  (* Some headers redeclare C-library functions for portability
+     (e.g. SDL_stdinc.h has `size_t strlcat(...)` inside an `#if !defined
+     HAVE_STRLCAT` block; our `#`-line stripper keeps the body). Stubs
+     for these collide with libc / clang-builtins at C-compile time. We
+     filter them out entirely; the user should call their SDL_-prefixed
+     equivalents (SDL_malloc, SDL_strlcat, ...) instead. *)
+  let libc_conflicts = [
+    "alloca"; "malloc"; "calloc"; "realloc"; "free";
+    "memcpy"; "memmove"; "memset"; "memcmp";
+    "strlen"; "strcpy"; "strncpy"; "strcat"; "strncat";
+    "strcmp"; "strncmp"; "strchr"; "strrchr"; "strstr";
+    "strdup"; "strndup"; "strlcat"; "strlcpy";
+    "snprintf"; "sprintf"; "vsnprintf"; "vsprintf";
+    "printf"; "fprintf"; "vfprintf"; "puts"; "fputs";
+    "atoi"; "atol"; "atof"; "abs"; "labs"; "rand"; "srand";
+    "exit"; "abort"; "getenv"; "setenv"; "unsetenv";
+    "qsort"; "bsearch";
+    (* MSVC-specific intrinsics that leak through from windows-gated
+       #if blocks when the preprocessor can't evaluate them. *)
+    "__debugbreak";
+  ] in
   let fns = List.filter_map
               (function Ast.Fn f -> Some f | _ -> None) tops in
+  let fns = List.filter
+              (fun f -> not (List.mem f.Ast.name libc_conflicts)) fns in
+  let fns = dedup_by (fun f -> f.Ast.name) fns in
   let structs = List.filter_map
                   (function Ast.Struct s -> Some s | _ -> None) tops in
+  let structs = dedup_by (fun s -> s.Ast.sname) structs in
   let aliases = List.filter_map
                   (function Ast.Alias (n, t) -> Some (n, t) | _ -> None)
                   tops in
   let enums = List.filter_map
                 (function Ast.Enum e -> Some e | _ -> None) tops in
+  let enums = dedup_by (fun e -> e.Ast.ename) enums in
   let simple_n =
     List.length (List.filter (Emit.is_simple_struct env smap) structs) in
 
   Printf.eprintf
-    "[C] %d function decls, %d structs (%d simple), %d enums from %s\n"
+    "[C] %d fn decls, %d structs (%d simple), %d enums, %d #defines from %s\n"
     (List.length fns) (List.length structs) simple_n
-    (List.length enums)
+    (List.length enums) (List.length defines)
     (Filename.basename header);
 
   let ml_path  = join !out_dir (base ^ "_external.ml") in
@@ -1939,7 +2247,7 @@ let process_c_header header =
 
   let oc = open_out ml_path in
   Emit.write_ml ~env ~smap ~prefix ~src:(Filename.basename header)
-    ~fns ~structs ~enums oc;
+    ~fns ~structs ~enums ~defines oc;
   close_out oc;
   Printf.printf "Wrote %s\n" ml_path;
 
@@ -1998,7 +2306,10 @@ let () =
       " Directory to write generated files into (default: cwd)";
       "--lib",     Arg.Set_string lib,
       " Library to ffi.load (default: use ffi.C, which assumes the lib \
-        is already loaded in-process)" ]
+        is already loaded in-process)";
+      "--strip",   Arg.Set_string strip,
+      " Comma-separated identifier tokens to drop before parsing \
+        (e.g. \"SDL_DECLSPEC,SDLCALL\")" ]
     (fun s -> remaining := s :: !remaining)
     "luabingen [opts] <file.h | file.lua>";
 
