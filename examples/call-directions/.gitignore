@@ -1,0 +1,8 @@
+prelude.cmi
+prelude.cmo
+prelude_stubs.o
+main.cmi
+main.cmo
+main.byte
+gen.lua
+main.lua
