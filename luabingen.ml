@@ -30,7 +30,9 @@ module Ast = struct
     | Double
     | Named of string               (* struct/typedef/enum name *)
     | Ptr of ctype
-    | Array of ctype                (* length is irrelevant for ABI *)
+    | Array of ctype * int option   (* length, when present, matters for
+                                       struct layout (`float v[4]` is 4
+                                       floats inline, not a pointer). *)
     | Const of ctype
 
   type param = { ptype : ctype; pname : string }
@@ -280,13 +282,26 @@ module Parse = struct
        | [] -> Void  (* shouldn't happen — treat as void *))
 
   (* Consume a run of "type words" (identifiers used as type specifiers)
-     and the trailing '*'s. Returns (ctype, consumed_anything). *)
+     and the trailing '*'s. Returns (ctype, consumed_anything).
+
+     Also handles tag-qualified `struct X` / `enum X` / `union X` —
+     consumes the keyword and treats the following identifier as the
+     named type, so e.g. `void f(struct Foo *p)` parses with Foo as
+     the type and p as the param name. *)
   let parse_type st =
     let words = ref [] in
     let saw_const = ref false in
     let going = ref true in
     while !going do
       match peek st with
+      | Some (TIdent ("struct" | "enum" | "union")) ->
+          advance st;
+          (match peek st with
+           | Some (TIdent n) ->
+               advance st;
+               words := n :: !words;
+               going := false
+           | _ -> going := false)
       | Some (TIdent w) when
           List.mem w
             ["const"; "volatile"; "static"; "extern"; "inline"; "restrict";
@@ -432,17 +447,31 @@ module Parse = struct
               match peek st with
               | Some (TIdent n) ->
                   advance st;
-                  (* swallow array sizes / bitfields *)
-                  (match peek st with
-                   | Some TLBrack -> collect_brack_until_close st
-                   | Some (TOther ':') ->
-                       (* bitfield: ': N' *)
-                       advance st;
-                       (match peek st with
-                        | Some (TInt _) -> advance st
-                        | _ -> ())
-                   | _ -> ());
-                  fields := { ftype = t; fname = n } :: !fields;
+                  (* Capture array length if present: `float v[4]` should
+                     contribute four float-sized slots to the struct,
+                     not a single one. *)
+                  let ftype =
+                    match peek st with
+                    | Some TLBrack ->
+                        let len =
+                          match st.toks with
+                          | _ :: TInt s :: _ ->
+                              (try Some (int_of_string s)
+                               with _ -> None)
+                          | _ -> None
+                        in
+                        collect_brack_until_close st;
+                        Array (t, len)
+                    | Some (TOther ':') ->
+                        (* bitfield: ': N' — drop info, keep base type *)
+                        advance st;
+                        (match peek st with
+                         | Some (TInt _) -> advance st
+                         | _ -> ());
+                        t
+                    | _ -> t
+                  in
+                  fields := { ftype; fname = n } :: !fields;
                   (match peek st with
                    | Some TComma -> advance st
                    | _ -> going2 := false)
@@ -642,19 +671,37 @@ module Parse = struct
           advance st;
           List.iter (fun d -> out := d :: !out) (parse_typedef st)
       | Some (TIdent "struct") ->
-          advance st;
-          let (tag, fields) = parse_struct_body st in
-          (match tag with
-           | Some n -> out := Struct { sname = n; fields } :: !out
-           | None -> ());
-          skip_until_top st [TSemi]
+          (* `struct Foo { ... };`  -> a struct definition.
+             `struct Foo somefn(...);` -> a function decl with a
+             tag-qualified return type. Look two tokens past the
+             tag for a `{` to disambiguate. *)
+          (match st.toks with
+           | _ :: TIdent _ :: TLBrace :: _ | _ :: TLBrace :: _ ->
+               advance st;
+               let (tag, fields) = parse_struct_body st in
+               (match tag with
+                | Some n -> out := Struct { sname = n; fields } :: !out
+                | None -> ());
+               skip_until_top st [TSemi]
+           | _ ->
+               (* Not a struct definition — let try_fn_decl handle it
+                  via parse_type, which understands `struct Foo`. *)
+               (match try_fn_decl st with
+                | Some d -> out := d :: !out
+                | None -> ()))
       | Some (TIdent "enum") ->
-          advance st;
-          let (tag, consts) = parse_enum_body st in
-          (match tag with
-           | Some n -> out := Enum { ename = n; consts } :: !out
-           | None -> ());
-          skip_until_top st [TSemi]
+          (match st.toks with
+           | _ :: TIdent _ :: TLBrace :: _ | _ :: TLBrace :: _ ->
+               advance st;
+               let (tag, consts) = parse_enum_body st in
+               (match tag with
+                | Some n -> out := Enum { ename = n; consts } :: !out
+                | None -> ());
+               skip_until_top st [TSemi]
+           | _ ->
+               (match try_fn_decl st with
+                | Some d -> out := d :: !out
+                | None -> ()))
       | Some TSemi -> advance st
       | Some _ ->
           (match try_fn_decl st with
@@ -697,7 +744,7 @@ module Typ = struct
          | _ -> t)
     | Const t' -> Const (resolve env t')
     | Ptr t'   -> Ptr (resolve env t')
-    | Array t' -> Array (resolve env t')
+    | Array (t', n) -> Array (resolve env t', n)
     | _ -> t
 
   (* CamelCase / PascalCase -> snake_case. Kept here (rather than in
@@ -819,7 +866,10 @@ module Emit = struct
     | Named n -> n
     | Const t -> "const " ^ c_of t
     | Ptr t -> c_of t ^ " *"
-    | Array t -> c_of t ^ " *"
+    | Array (t, _) -> c_of t ^ " *"
+        (* used for function parameters where the array decays to a
+           pointer; field-position arrays go through `field_decl` below
+           so the [N] suffix lands in the right place. *)
 
   (* Classify a *C* type for boundary conversion. Drives Lua-side
      unwrapping of args and re-tagging of returns. We distinguish
@@ -868,12 +918,21 @@ module Emit = struct
     | APassthrough -> "return " ^ expr_str
 
   (* Sequence of (constructor_name, struct_def) for the simple structs
-     in `structs`. Order is preserved so OCaml emit is stable. *)
-  let constructors env smap structs =
+     in `structs`. Skips constructor emission if a function with the
+     same name already exists (e.g. raylib has no `MakeColor`, but a
+     header that does would otherwise produce duplicate externals).
+     Order preserved for stable output. *)
+  let constructors ~prefix ~fns env smap structs =
+    let fn_names = Hashtbl.create 32 in
+    List.iter (fun fn ->
+      Hashtbl.replace fn_names
+        (snake (strip_prefix prefix fn.name)) ()
+    ) fns;
     List.filter_map (fun s ->
-      if is_simple_struct env smap s
-      then Some ("make_" ^ snake s.sname, s)
-      else None
+      if not (is_simple_struct env smap s) then None
+      else
+        let n = "make_" ^ snake s.sname in
+        if Hashtbl.mem fn_names n then None else Some (n, s)
     ) structs
 
   (* Per-field accessor name: <struct>_<field> in snake_case. Field
@@ -902,7 +961,11 @@ module Emit = struct
       else
         List.filter_map (fun f ->
           let n = accessor_name s f in
-          if Hashtbl.mem fn_names n then None
+          let is_array = match f.ftype with Array _ -> true | _ -> false in
+          (* Skip arrays — they'd need a different API (return a Lua
+             cdata array, not a single value). Skip name collisions
+             with existing functions. *)
+          if is_array || Hashtbl.mem fn_names n then None
           else Some (n, s, f)
         ) s.fields
     ) structs
@@ -966,8 +1029,8 @@ module Emit = struct
       let sig_ =
         String.concat " -> " (arg_types @ [snake s.sname]) in
       Printf.fprintf out "external %s : %s = \"%s\"\n" cname sig_ cname
-    ) (constructors env smap structs);
-    if constructors env smap structs <> []
+    ) (constructors ~prefix ~fns env smap structs);
+    if constructors ~prefix ~fns env smap structs <> []
     then Printf.fprintf out "\n";
     (* Field accessors: one external per struct field. Lets OCaml read
        fields of struct values returned by C, e.g. (vector2_x pos). *)
@@ -1007,7 +1070,7 @@ module Emit = struct
       else List.iteri (fun i _ ->
         Printf.fprintf out "(void)v%d; " (i + 1)) s.fields;
       Printf.fprintf out "return Val_int(0); }\n"
-    ) (constructors env smap structs);
+    ) (constructors ~prefix ~fns env smap structs);
     (* Accessor stubs (also never executed). *)
     List.iter (fun (aname, _s, _f) ->
       Printf.fprintf out
@@ -1053,7 +1116,16 @@ module Emit = struct
           any_type := true;
           Printf.fprintf out "  typedef struct %s {\n" s.sname;
           List.iter (fun f ->
-            Printf.fprintf out "    %s %s;\n" (c_of f.ftype) f.fname
+            (* Arrays are written with the [N] suffix in field position,
+             not as a pointer — that's how C declares them and what
+             ffi.cdef expects for inline struct layout. *)
+          (match f.ftype with
+           | Array (inner, Some n) ->
+               Printf.fprintf out "    %s %s[%d];\n" (c_of inner) f.fname n
+           | Array (inner, None) ->
+               Printf.fprintf out "    %s %s[];\n" (c_of inner) f.fname
+           | _ ->
+               Printf.fprintf out "    %s %s;\n" (c_of f.ftype) f.fname)
           ) s.fields;
           Printf.fprintf out "  } %s;\n" s.sname
       | Struct s ->
@@ -1099,7 +1171,7 @@ module Emit = struct
        end\n\n";
 
     (* Struct constructors. *)
-    let ctors = constructors env smap structs in
+    let ctors = constructors ~prefix ~fns env smap structs in
     if ctors <> [] then
       Printf.fprintf out "-- Struct constructors\n";
     List.iter (fun (cname, s) ->

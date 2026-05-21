@@ -100,8 +100,12 @@ typed keyboard polling.
 
 - **OCaml callbacks into C** — raylib's `SetTraceLogCallback` etc.
   would need a real OCaml-fn → C-fn-ptr bridge. Not done.
-- **Reading struct fields from OCaml** — no `color_r`, `vector2_x`
-  accessors are emitted. Fine for this demo; the player position
-  lives in OCaml-side state, not in a Vector2.
 - **Sound** — would work in principle (the bindings cover raudio) but
   not exercised by this example.
+
+The mouse-follow dot at the cursor uses generated field accessors
+(`vector2_x`, `vector2_y`) on the `Vector2` returned by
+`get_mouse_position`, so scalar-field reads round-trip end-to-end.
+Array fields (`float params[4]`, `Matrix projection[2]`) don't have
+accessors yet — the struct's *layout* is preserved correctly, you
+just can't read the array out element-by-element from OCaml.

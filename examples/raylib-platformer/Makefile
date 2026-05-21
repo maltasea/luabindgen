@@ -20,7 +20,9 @@ OBJS      = raylib_stubs.o raylib_external.cmo main.cmo
 all: main.lua
 
 # 1. Generate the three binding files from the raylib header.
-$(GENERATED): $(LUABINGEN) $(RAYLIB_H)
+# Grouped target (GNU make 4.3+): one recipe produces all three files,
+# so parallel `make -j` can't race by launching duplicate generators.
+$(GENERATED) &: $(LUABINGEN) $(RAYLIB_H)
 	ocaml -I +str str.cma $(LUABINGEN) \
 	  --prefix "RLAPI" --lib raylib --out-dir . $(RAYLIB_H)
 

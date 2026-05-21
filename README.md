@@ -147,5 +147,11 @@ for the full pipeline. The shape is:
 - **Multi-line C prototypes** — the lexer handles them fine; raylib.h
   happens to be all single-line so this isn't exercised.
 - **Lua input typing** — placeholder `float` signatures; user edits.
-- **Field accessors** — no `color_r`, `vector2_x` getters emitted yet.
-  Use constructors + pass struct values around opaquely.
+- **Array fields in field accessors** — scalar field accessors
+  (`color_r`, `vector2_x`) are emitted; array fields (`float
+  params[4]`, `Matrix projection[2]`) are skipped since the generic
+  single-value wrapper can't return a Lua cdata array meaningfully.
+  Struct *layout* preserves the array, so passing the parent struct
+  through still works correctly.
+- **Setters** — only getters, no setters yet. Construct new struct
+  values with the `make_*` constructors and replace whole.
