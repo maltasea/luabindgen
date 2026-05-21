@@ -400,23 +400,30 @@ module Parse = struct
                | Some (TIdent n) -> advance st; n
                | _ -> ""
              in
-             (* swallow array suffix `[N]` or `[]` *)
-             (match peek st with
-              | Some TLBrack ->
-                  let _ = collect_brack_until_close st in ()
-              | _ -> ());
+             (* In C, `T name[N]` as a function parameter decays to
+                `T *name`. Use Ptr so abi_of/ocaml_of treat it as a
+                pointer, not a single value. *)
+             let t =
+               match peek st with
+               | Some TLBrack ->
+                   collect_brack_until_close st;
+                   Ptr t
+               | _ -> t
+             in
              Some { ptype = t; pname = name })
     | _ ->
         let t = parse_type st in
-        (* The next token is either the param name, or a comma/RParen
-           if the param was anonymous. *)
         let name = match peek st with
           | Some (TIdent n) -> advance st; n
           | _ -> ""
         in
-        (match peek st with
-         | Some TLBrack -> collect_brack_until_close st
-         | _ -> ());
+        let t =
+          match peek st with
+          | Some TLBrack ->
+              collect_brack_until_close st;
+              Ptr t
+          | _ -> t
+        in
         Some { ptype = t; pname = name }
 
   and collect_brack_until_close st =
@@ -824,9 +831,15 @@ module Parse = struct
            | _ :: TIdent _ :: TLBrace :: _ | _ :: TLBrace :: _ ->
                advance st;
                let (tag, consts) = parse_enum_body st in
-               (match tag with
-                | Some n -> out := Enum { ename = n; consts } :: !out
-                | None -> ());
+               (* Anonymous top-level enums (`enum { A=1, B=2 };`) are
+                  the C pattern for grouped constants. The constants
+                  are still useful even though there's no type name.
+                  Emit with a synthetic empty ename — the constant
+                  walker doesn't need the tag, and the cdef emitter
+                  skips enums with empty ename so we don't try to
+                  `typedef int "";`. *)
+               let ename = match tag with Some n -> n | None -> "" in
+               out := Enum { ename; consts } :: !out;
                skip_until_top st [TSemi]
            | _ ->
                (match try_fn_decl st with
@@ -1011,7 +1024,8 @@ module Emit = struct
     | ABool
     | AFloat
     | AStruct         (* struct-by-value: block {0, cdata} *)
-    | APassthrough    (* string, pointer, callback handle, ... *)
+    | AString         (* `const char *` / `char *` *)
+    | APassthrough    (* opaque pointer, cdata handle *)
 
   let abi_of env t =
     let rec go t = match Typ.resolve env t with
@@ -1021,6 +1035,7 @@ module Emit = struct
       | Ast.Long _ | Ast.LongLong _ -> AInt
       | Ast.Float | Ast.Double -> AFloat
       | Ast.Const t' -> go t'
+      | Ast.Ptr (Char _) | Ast.Ptr (Const (Char _)) -> AString
       | Ast.Ptr _ | Ast.Array _ -> APassthrough
       | Ast.Named n ->
           (match Hashtbl.find_opt env n with
@@ -1034,6 +1049,10 @@ module Emit = struct
     match abi_of env t with
     | AInt | AFloat | ABool -> "ocaml_val(" ^ name ^ ")"
     | AStruct -> name ^ "[2]"     (* block {0, cdata} -> cdata *)
+    (* Strings: OCaml-side lua_of_ocaml strings are already Lua strings,
+       which LuaJIT FFI accepts as `const char *` directly. No
+       unwrapping needed on the arg side. *)
+    | AString -> name
     | AVoid | APassthrough -> name
 
   (* How to re-tag a C return value back into the OCaml encoding the
@@ -1045,6 +1064,12 @@ module Emit = struct
     | ABool   -> "return (" ^ expr_str ^ ") and 2 or 0"
     | AFloat  -> "return { 253, " ^ expr_str ^ " }"
     | AStruct -> "return { 0, " ^ expr_str ^ " }"
+    (* String returns: C hands back a `const char *` cdata pointer.
+       lua_of_ocaml expects a Lua string for OCaml-side `string`.
+       ffi.string copies the C bytes; nil-safe through a local. *)
+    | AString ->
+        "local _s = " ^ expr_str ^
+        " return (_s ~= nil) and ffi.string(_s) or \"\""
     | APassthrough -> "return " ^ expr_str
 
   (* Sequence of (constructor_name, struct_def) for the simple structs
@@ -1104,7 +1129,18 @@ module Emit = struct
      hex literals (good enough for raylib.h's enums). Anything more
      complex falls back to "previous + 1" auto-increment. *)
   let parse_int_lit s =
-    try Some (int_of_string (String.trim s))
+    (* Strip trailing integer suffixes (u/U, l/L, ll/LL, ul/lu in any
+       order) before passing to int_of_string. Without this, enum
+       values like `0x20u` silently fall back to previous + 1. *)
+    let s = String.trim s in
+    let n = String.length s in
+    let stop = ref n in
+    while !stop > 0 &&
+          let c = s.[!stop - 1] in
+          c = 'u' || c = 'U' || c = 'l' || c = 'L'
+    do decr stop done;
+    let s = String.sub s 0 !stop in
+    try Some (int_of_string s)
     with _ -> None
 
   let enum_values e =
@@ -2222,7 +2258,14 @@ let process_c_header header =
               (function Ast.Fn f -> Some f | _ -> None) tops in
   let fns = List.filter
               (fun f -> not (List.mem f.Ast.name libc_conflicts)) fns in
-  let fns = dedup_by (fun f -> f.Ast.name) fns in
+  (* Dedup by the snake-cased, prefix-stripped name we actually emit —
+     two C names like `FooBar` and `Foo_Bar` both snake to `foo_bar`
+     and would otherwise produce duplicate `CAMLprim` definitions. *)
+  let fns =
+    dedup_by
+      (fun f -> Emit.snake (Emit.strip_prefix prefix f.Ast.name))
+      fns
+  in
   let structs = List.filter_map
                   (function Ast.Struct s -> Some s | _ -> None) tops in
   let structs = dedup_by (fun s -> s.Ast.sname) structs in
@@ -2231,7 +2274,29 @@ let process_c_header header =
                   tops in
   let enums = List.filter_map
                 (function Ast.Enum e -> Some e | _ -> None) tops in
+  (* Dedup named enums by their tag. Anonymous enums (ename="") each
+     carry an independent group of constants, so tag them with a
+     synthetic unique name before deduping. *)
+  let enums =
+    let anon_idx = ref 0 in
+    List.map (fun e ->
+      if e.Ast.ename = ""
+      then begin
+        incr anon_idx;
+        { e with Ast.ename = Printf.sprintf "\x00anon%d" !anon_idx }
+      end else e
+    ) enums
+  in
   let enums = dedup_by (fun e -> e.Ast.ename) enums in
+  (* Drop the synthetic-anon marker for downstream code that displays
+     the ename (e.g. cdef emit skips empty ename — we want it to also
+     skip the synthetic ones). *)
+  let enums =
+    List.map (fun e ->
+      if String.length e.Ast.ename > 0 && e.Ast.ename.[0] = '\x00'
+      then { e with Ast.ename = "" } else e
+    ) enums
+  in
   let simple_n =
     List.length (List.filter (Emit.is_simple_struct env smap) structs) in
 
