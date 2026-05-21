@@ -6,16 +6,22 @@ full luabindgen pipeline drives raylib.
 
 ## requires
 
-- **OCaml 5.4.x** — bytecode magic `Caml1999X036` to match the bundled
-  `loo` binary. On older switches `ocamlc` produces `Caml1999X035` and
-  loo fails with `Bad_magic_version`. To swap on this machine:
+- **An OCaml whose bytecode magic matches `loo`'s.** The bundled
+  `loo` binary embeds a specific `Caml1999XNNN` magic; compiling with
+  a different OCaml series fails with `Bad_magic_version`. To check:
 
-      eval $(opam env --switch=/Users/ben --set-switch)
+      strings ../../extern/lua_of_ocaml/_build/default/compiler/bin-lua_of_ocaml/main.exe \
+        | grep -E "Caml1999X[0-9]"
+
+  Typical mapping: `X031`=4.14, `X034`=5.2, `X035`=5.3, `X036`=5.4.
+  Activate the matching switch before `make`:
+
+      eval $(opam env --switch=<matching version> --set-switch)
 
 - **luajit** — `which luajit`
 
-- **raylib** — `brew install raylib` (puts `libraylib.dylib` somewhere
-  `ffi.load("raylib")` can find via the system dyld path)
+- **raylib** — `brew install raylib`. The dylib must be discoverable
+  by `ffi.load("raylib")` (brew puts it where macOS dyld looks).
 
 ## run
 

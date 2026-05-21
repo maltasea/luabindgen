@@ -8,8 +8,11 @@ well-known C library beyond raylib.
 
 ## requires
 
-- **OCaml 5.4.x** — same bytecode-magic requirement as the other
-  examples. On this machine: `eval $(opam env --switch=/Users/ben --set-switch)`.
+- **An OCaml whose bytecode magic matches `loo`'s.** See the top-level
+  README's "bytecode-magic gotcha" section; check what `loo` expects
+  with `strings ../../extern/lua_of_ocaml/_build/.../main.exe | grep
+  -E "Caml1999X[0-9]"` and `eval $(opam env --switch=<version>
+  --set-switch)` before `make`.
 - **luajit** in PATH.
 - **SDL3** — `brew install sdl3`. The dylib must be discoverable by
   `ffi.load("SDL3")` (brew puts it where macOS dyld looks).

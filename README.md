@@ -26,15 +26,41 @@ wrappers that the lua_of_ocaml runtime calls into.
 
 ## install / run
 
-Requires OCaml 4.13+ with the `str` library — no opam packages, no dune.
+The generator itself needs OCaml 4.10+ with the `str` library — no
+opam packages, no dune.
 
     ocaml -I +str str.cma luabingen.ml [opts] <file.h | file.lua>
 
 Options:
 
-    --prefix PREFIX     strip a leading identifier prefix (e.g. "RLAPI")
+    --prefix PFX        strip a leading identifier prefix (e.g. "RLAPI")
     --lib NAME          emit `local C = ffi.load("NAME")` (default: ffi.C)
     --out-dir DIR       write generated files into DIR (default: cwd)
+    --strip TOK,...     drop identifier tokens before parsing
+                        (e.g. "SDL_DECLSPEC,SDLCALL")
+
+When the parser gives up on a declaration it prints a `  warn:` line
+to stderr (anonymous unions, inline function bodies, unrecognized
+typedef shapes). Raylib emits zero; SDL3 emits about a dozen.
+
+## the bytecode-magic gotcha
+
+To use the *output*, your OCaml must match the version `loo` (the
+lua_of_ocaml compiler) was built against. The bundled `loo` binary
+embeds a specific OCaml bytecode magic (`Caml1999XNNN`); compiling
+your `.ml` with a different OCaml series produces a mismatched magic
+and `loo` fails with `Bad_magic_version`.
+
+Check what your `loo` expects:
+
+    strings extern/lua_of_ocaml/_build/default/compiler/bin-lua_of_ocaml/main.exe \
+      | grep -E "Caml1999X[0-9]"
+
+Then pick the matching opam switch (typical mapping: `X031`=4.14,
+`X034`=5.2, `X035`=5.3, `X036`=5.4). If `loo` was rebuilt against a
+different OCaml since the example was last run, the example will fail
+with `Bad_magic_version` until you `eval $(opam env --switch=<right
+version> --set-switch)` before `make`.
 
 ## C input
 
