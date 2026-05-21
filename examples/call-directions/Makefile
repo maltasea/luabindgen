@@ -17,8 +17,13 @@ LUAJIT ?= luajit
 
 OBJS = prelude_stubs.o prelude.cmo main.cmo
 
-.PHONY: all run clean
+.PHONY: all run check clean
 all: main.lua
+
+# `check` runs the program; each direction asserts PASS/FAIL; the
+# program exits non-zero on any failure. Suitable for a CI hook.
+check: main.lua
+	@$(LUAJIT) main.lua
 
 prelude_stubs.o: prelude_stubs.c
 	$(OCAMLC) -c prelude_stubs.c

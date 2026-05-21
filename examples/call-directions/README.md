@@ -61,20 +61,32 @@ the OCaml function is a Lua function.)
 ## run
 
 ```
-make run
+make check
 ```
 
-Expected output ends with:
+Each direction is a real assertion: the OCaml side calls into the
+chain, the chain returns a value, OCaml checks it against an
+expected result, prints PASS/FAIL, and the program exits non-zero
+on any failure.
 
 ```
+=== (1) OCaml -> C ===
+  PASS  c_strlen returns 13              got 13
+=== (2) OCaml -> Lua ===
+  PASS  lua_uppercase returns 'ABC DEF'  got "ABC DEF"
+=== (3) OCaml -> Lua -> C (chained) ===
+  PASS  chained returns 12               got 12
+=== (4) Lua -> OCaml ===
+  PASS  lua got reverse_words result     got "ocaml from world hello"
+=== (5) Lua -> C  (no OCaml in the chain) ===
+  PASS  lua's strlen('hello from lua') = 14 got 14
 === (6) C -> Lua  (qsort calls a Lua comparator) ===
-   [Lua] sorted result: 1, 2, 4, 5, 8
-   [Lua] C qsort called our Lua comparator 8 times
+  PASS  qsort called comparator at least 4 times comparator was called 8 times
 
-done.
+6 passed, 0 failed
 ```
 
-If `qsort` calls the Lua comparator 8 times to sort 5 elements, you've
-genuinely got C calling into Lua at runtime — the JIT-compiled Lua
-function is being invoked synchronously by libc's qsort via a
-function-pointer argument it received from us.
+Direction (6) is the strongest: libc's `qsort` synchronously calls
+back into a JIT-compiled Lua function 8 times to sort 5 elements,
+via the function-pointer arg it received from us through
+`ffi.cast`. That's a C library calling into Lua at runtime.
