@@ -11,6 +11,12 @@ from either a C header or a Lua source. Single OCaml file, stdlib +
 A working end-to-end demo (OCaml game → raylib via luajit) lives in
 [`examples/raylib-platformer/`](examples/raylib-platformer/).
 
+For a complete walkthrough of every input → output mapping the
+generator handles (function decls, structs, enums, typedefs,
+#defines, the prelude pattern for cases the generator can't reach,
+and all six cross-language calling directions at runtime), read
+**[`docs/book.md`](docs/book.md)**.
+
 ## what it generates
 
 Each run emits three sibling files (named after the input):
